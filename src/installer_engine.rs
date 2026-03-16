@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
+use flate2::read::GzDecoder;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use sysinfo::{ProcessesToUpdate, Signal, System};
@@ -128,7 +129,7 @@ where
         .context("中止目标进程时出现错误, 安装被中止")?;
 
     report_progress(50);
-    extract_app_zip(install_path).context("解压程序时出现错误, 安装被中止")?;
+    extract_app_package(install_path).context("解压程序时出现错误, 安装被中止")?;
 
     report_progress(70);
     write_install_support_files(install_path).context("创建卸载程序时出现错误, 安装被中止")?;
@@ -198,10 +199,20 @@ fn uninstall_entry_name() -> String {
     format!("{{{}}}_ModernInstaller", resources::application_uuid())
 }
 
-fn extract_app_zip(install_path: &Path) -> Result<()> {
+fn extract_app_package(install_path: &Path) -> Result<()> {
     fs::create_dir_all(install_path)?;
-    let reader = Cursor::new(resources::app_zip());
-    let mut archive = ZipArchive::new(reader).context("invalid app.zip data")?;
+    let package_payload = inflate_gzip_bytes(resources::app_package_gz()).context("invalid app package gzip stream")?;
+    match resources::app_package_kind() {
+        "zip" => extract_zip_package(install_path, &package_payload),
+        "tar" => extract_tar_package(install_path, &package_payload),
+        "tar.gz" => extract_tar_gz_package(install_path, &package_payload),
+        unknown => bail!("unsupported app package kind: {unknown}"),
+    }
+}
+
+fn extract_zip_package(install_path: &Path, package_payload: &[u8]) -> Result<()> {
+    let reader = Cursor::new(package_payload);
+    let mut archive = ZipArchive::new(reader).context("invalid zip package data")?;
 
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
@@ -224,13 +235,47 @@ fn extract_app_zip(install_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn extract_tar_package(install_path: &Path, package_payload: &[u8]) -> Result<()> {
+    let reader = Cursor::new(package_payload);
+    let mut archive = tar::Archive::new(reader);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.unpack_in(install_path)? {
+            bail!("invalid path in tar package");
+        }
+    }
+    Ok(())
+}
+
+fn extract_tar_gz_package(install_path: &Path, package_payload: &[u8]) -> Result<()> {
+    let reader = Cursor::new(package_payload);
+    let decoder = GzDecoder::new(reader);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.unpack_in(install_path)? {
+            bail!("invalid path in tar.gz package");
+        }
+    }
+    Ok(())
+}
+
 fn write_install_support_files(install_path: &Path) -> Result<()> {
+    let uninstaller_bytes =
+        inflate_gzip_bytes(resources::embedded_uninstaller_gz()).context("invalid uninstaller gzip stream")?;
     fs::write(
         install_path.join("ModernInstaller.Uninstaller.exe"),
-        resources::embedded_uninstaller_exe(),
+        uninstaller_bytes,
     )?;
     fs::write(install_path.join("info.json"), resources::embedded_info_json())?;
     Ok(())
+}
+
+fn inflate_gzip_bytes(gzip_bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = GzDecoder::new(gzip_bytes);
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output)?;
+    Ok(output)
 }
 
 fn write_registry_values(info: &InstallerInfo, install_path: &Path) -> Result<()> {

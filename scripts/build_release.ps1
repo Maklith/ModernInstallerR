@@ -3,6 +3,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function Copy-WithRetry {
     param(
@@ -21,6 +22,33 @@ function Copy-WithRetry {
             }
             Start-Sleep -Milliseconds 500
         }
+    }
+}
+
+function Compress-ToGzip {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $inputStream = [System.IO.File]::OpenRead($Source)
+    try {
+        $outputStream = [System.IO.File]::Create($Destination)
+        try {
+            $gzip = New-Object System.IO.Compression.GZipStream(
+                $outputStream,
+                [System.IO.Compression.CompressionLevel]::Optimal
+            )
+            try {
+                $inputStream.CopyTo($gzip)
+            } finally {
+                $gzip.Dispose()
+            }
+        } finally {
+            $outputStream.Dispose()
+        }
+    } finally {
+        $inputStream.Dispose()
     }
 }
 
@@ -55,9 +83,16 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $installerExe = Join-Path $root "target\$target\$profile\modern_installer_r.exe"
 $distDir = Join-Path $root "dist\$target"
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
-Copy-WithRetry -Source $installerExe -Destination (Join-Path $distDir "ModernInstaller.exe")
-Copy-WithRetry -Source $uninstallerExe -Destination (Join-Path $distDir "ModernInstaller.Uninstaller.exe")
+$installerDist = Join-Path $distDir "ModernInstaller.exe"
+$uninstallerDist = Join-Path $distDir "ModernInstaller.Uninstaller.exe"
+Copy-WithRetry -Source $installerExe -Destination $installerDist
+Copy-WithRetry -Source $uninstallerExe -Destination $uninstallerDist
+
+Compress-ToGzip -Source $installerDist -Destination (Join-Path $distDir "ModernInstaller.exe.gz")
+Compress-ToGzip -Source $uninstallerDist -Destination (Join-Path $distDir "ModernInstaller.Uninstaller.exe.gz")
 
 Write-Host "Done. Outputs:"
-Write-Host "  $(Join-Path $distDir 'ModernInstaller.exe')"
-Write-Host "  $(Join-Path $distDir 'ModernInstaller.Uninstaller.exe')"
+Write-Host "  $installerDist"
+Write-Host "  $uninstallerDist"
+Write-Host "  $(Join-Path $distDir 'ModernInstaller.exe.gz')"
+Write-Host "  $(Join-Path $distDir 'ModernInstaller.Uninstaller.exe.gz')"
