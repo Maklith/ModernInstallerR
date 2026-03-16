@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use eframe::egui::IconData;
 
 use crate::model::InstallerInfo;
 
@@ -7,8 +8,12 @@ const AGREEMENT_TEXT: &str = include_str!("../installer_assets/Agreement.txt");
 const APPLICATION_UUID: &str = include_str!("../installer_assets/ApplicationUUID");
 const APP_PACKAGE_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/App.package.gz"));
 const APP_PACKAGE_KIND: &str = include_str!(concat!(env!("OUT_DIR"), "/App.package.kind"));
-const EMBEDDED_UNINSTALLER_GZ: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/ModernInstaller.Uninstaller.exe.gz"));
+const EMBEDDED_UNINSTALLER_GZ: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/ModernInstaller.Uninstaller.exe.gz"
+));
+const INSTALLER_ICON_PNG: &[u8] = include_bytes!("../installer_assets/IconPack.png");
+const UNINSTALLER_ICON_PNG: &[u8] = include_bytes!("../installer_assets/IconUninstall.png");
 
 pub fn installer_info() -> Result<InstallerInfo> {
     serde_json::from_str(INFO_JSON).context("failed to parse installer info.json")
@@ -36,4 +41,14 @@ pub fn embedded_info_json() -> &'static [u8] {
 
 pub fn embedded_uninstaller_gz() -> &'static [u8] {
     EMBEDDED_UNINSTALLER_GZ
+}
+
+pub fn installer_icon_data() -> Result<IconData> {
+    eframe::icon_data::from_png_bytes(INSTALLER_ICON_PNG)
+        .context("failed to decode installer icon png")
+}
+
+pub fn uninstaller_icon_data() -> Result<IconData> {
+    eframe::icon_data::from_png_bytes(UNINSTALLER_ICON_PNG)
+        .context("failed to decode uninstaller icon png")
 }

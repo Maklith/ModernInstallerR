@@ -37,6 +37,7 @@ struct InstallerApp {
     error_text: Option<String>,
     worker_rx: Option<Receiver<InstallWorkerEvent>>,
     result: Option<InstallResult>,
+    logo_texture: Option<egui::TextureHandle>,
 }
 
 impl InstallerApp {
@@ -55,6 +56,32 @@ impl InstallerApp {
             error_text: None,
             worker_rx: None,
             result: None,
+            logo_texture: None,
+        }
+    }
+
+    fn ensure_logo_texture(&mut self, ctx: &egui::Context) {
+        if self.logo_texture.is_some() {
+            return;
+        }
+        let Ok(icon_data) = resources::installer_icon_data() else {
+            return;
+        };
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [icon_data.width as usize, icon_data.height as usize],
+            &icon_data.rgba,
+        );
+        let texture = ctx.load_texture(
+            "installer_panel_logo",
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.logo_texture = Some(texture);
+    }
+
+    fn show_logo(&self, ui: &mut egui::Ui, size: f32) {
+        if let Some(texture) = self.logo_texture.as_ref() {
+            ui.add(egui::Image::from_texture(texture).fit_to_exact_size(egui::vec2(size, size)));
         }
     }
 
@@ -141,7 +168,9 @@ impl InstallerApp {
 
     fn launch_application(&mut self) {
         if let Some(done) = self.result.as_ref() {
-            if let Err(error) = installer_engine::launch_application(&done.executable_path, &done.installed_path) {
+            if let Err(error) =
+                installer_engine::launch_application(&done.executable_path, &done.installed_path)
+            {
                 self.error_text = Some(format!("启动应用失败: {error}"));
             }
         }
@@ -150,6 +179,7 @@ impl InstallerApp {
 
 impl eframe::App for InstallerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ensure_logo_texture(ctx);
         self.poll_worker();
         if matches!(self.phase, InstallPhase::Installing) {
             ctx.request_repaint_after(Duration::from_millis(33));
@@ -157,65 +187,79 @@ impl eframe::App for InstallerApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.phase {
             InstallPhase::BeforeInstall => {
-                ui.add_space(16.0);
-                ui.heading(RichText::new(&self.info.display_name).size(28.0));
-                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    let top_space = if self.show_detail { 72.0 } else { 92.0 };
+                    ui.add_space(top_space);
+                    self.show_logo(ui, 72.0);
+                    ui.add_space(10.0);
+                    ui.heading(RichText::new(&self.info.display_name).size(28.0));
+                    ui.add_space(6.0);
 
-                if !self.show_detail {
-                    let button_label = if self.is_update() { "安装更新" } else { "一键安装" };
-                    if ui
-                        .add_sized([180.0, 42.0], egui::Button::new(button_label))
-                        .clicked()
-                    {
-                        self.start_install();
-                    }
-                    ui.add_space(8.0);
-                    if let Some(old_version) = self.existing.installed_version.as_ref() {
-                        let mut text = format!("已安装版本: {old_version}");
-                        if self.is_update() {
-                            text.push_str(&format!("  ->  {}", self.info.display_version));
+                    if !self.show_detail {
+                        let button_label = if self.is_update() {
+                            "安装更新"
+                        } else {
+                            "一键安装"
+                        };
+                        if ui
+                            .add_sized([180.0, 42.0], egui::Button::new(button_label))
+                            .clicked()
+                        {
+                            self.start_install();
                         }
-                        ui.label(text);
+                        ui.add_space(8.0);
+                        if let Some(old_version) = self.existing.installed_version.as_ref() {
+                            let mut text = format!("已安装版本: {old_version}");
+                            if self.is_update() {
+                                text.push_str(&format!("  ->  {}", self.info.display_version));
+                            }
+                            ui.label(text);
+                        }
+                        if !self.is_update() && ui.link("更多安装选项").clicked() {
+                            self.show_detail = true;
+                        }
+                    } else {
+                        ui.horizontal_centered(|ui| {
+                            ui.add_sized(
+                                [390.0, 32.0],
+                                egui::TextEdit::singleline(&mut self.install_path),
+                            );
+                            if ui.button("修改").clicked() {
+                                self.pick_folder();
+                            }
+                        });
+                        ui.add_space(8.0);
+                        if ui
+                            .add_sized([180.0, 40.0], egui::Button::new("安装"))
+                            .clicked()
+                        {
+                            self.start_install();
+                        }
                     }
-                    if !self.is_update() && ui.link("更多安装选项").clicked() {
-                        self.show_detail = true;
-                    }
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.add_sized([390.0, 32.0], egui::TextEdit::singleline(&mut self.install_path));
-                        if ui.button("修改").clicked() {
-                            self.pick_folder();
+
+                    ui.add_space(16.0);
+                    ui.horizontal_centered(|ui| {
+                        ui.checkbox(&mut self.agreed, "我已阅读并同意");
+                        if ui.link("《用户协议》").clicked() {
+                            self.show_agreement = true;
                         }
                     });
-                    ui.add_space(8.0);
-                    if ui
-                        .add_sized([180.0, 40.0], egui::Button::new("安装"))
-                        .clicked()
-                    {
-                        self.start_install();
-                    }
-                }
 
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.agreed, "我已阅读并同意");
-                    if ui.link("《用户协议》").clicked() {
-                        self.show_agreement = true;
+                    if let Err(error) = self.validate_current() {
+                        ui.add_space(8.0);
+                        ui.colored_label(Color32::from_rgb(196, 20, 20), error.to_string());
+                    }
+                    if let Some(error) = self.error_text.as_ref() {
+                        ui.add_space(8.0);
+                        ui.colored_label(Color32::from_rgb(196, 20, 20), error);
                     }
                 });
-
-                if let Err(error) = self.validate_current() {
-                    ui.add_space(8.0);
-                    ui.colored_label(Color32::from_rgb(196, 20, 20), error.to_string());
-                }
-                if let Some(error) = self.error_text.as_ref() {
-                    ui.add_space(8.0);
-                    ui.colored_label(Color32::from_rgb(196, 20, 20), error);
-                }
             }
             InstallPhase::Installing => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(110.0);
+                    self.show_logo(ui, 64.0);
+                    ui.add_space(8.0);
                     ui.heading("安装中...");
                     ui.add_space(10.0);
                     ui.add(
@@ -228,6 +272,8 @@ impl eframe::App for InstallerApp {
             InstallPhase::AfterInstall => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(110.0);
+                    self.show_logo(ui, 64.0);
+                    ui.add_space(8.0);
                     ui.heading(format!("{} 安装完成", self.info.display_name));
                     ui.add_space(18.0);
                     ui.horizontal(|ui| {
@@ -288,12 +334,15 @@ fn main() -> eframe::Result {
     }
 
     let info = resources::installer_info().expect("failed to load installer info");
+    let installer_icon = resources::installer_icon_data().expect("failed to load installer icon");
     let app = InstallerApp::new(info);
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("ModernInstaller")
             .with_inner_size([640.0, 420.0])
-            .with_resizable(false),
+            .with_resizable(false)
+            .with_icon(installer_icon),
+        centered: true,
         ..Default::default()
     };
     eframe::run_native(
