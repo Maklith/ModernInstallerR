@@ -1,0 +1,2 @@
+# Optional: put extra runtime chars here, one line is enough.
+# Example: dynamic product names, runtime error prefixes, uncommon symbols.
