@@ -4,7 +4,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use font_subset::Font;
 
 const SOURCE_FONT_REL: &str = "installer_assets/HarmonyOS_Sans_SC_Regular.ttf";
 const GENERATED_FONT_NAME: &str = "HarmonyOS_Sans_SC_Subset.ttf";
@@ -19,7 +20,10 @@ fn main() {
     let generated_text = out_dir.join(GENERATED_TEXT_NAME);
 
     println!("cargo:rerun-if-changed={}", source_font.display());
-    println!("cargo:rerun-if-changed={}", manifest_dir.join("installer_assets/info.json").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("installer_assets/info.json").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("installer_assets/Agreement.txt").display()
@@ -37,15 +41,17 @@ fn main() {
     let chars = collect_chars(&manifest_dir).expect("failed to collect characters for font subset");
     fs::write(&generated_text, chars.as_bytes()).expect("failed to write character list");
 
-    let generated_ok = generate_subset_font(&source_font, &generated_text, &generated_font)
+    let generated_ok = generate_subset_font_with_rust(&source_font, &chars, &generated_font)
         .unwrap_or_else(|error| {
             println!("cargo:warning=font subsetting failed: {error}");
             false
         });
 
-    if !generated_ok {
+    if generated_ok {
+        println!("cargo:warning=font subset generated with pure Rust (font-subset)");
+    } else {
         fs::copy(&source_font, &generated_font).expect("failed to fallback to full font");
-        println!("cargo:warning=using full Harmony font because subset generation was unavailable");
+        println!("cargo:warning=using full Harmony font because Rust subsetting failed");
     }
 }
 
@@ -77,7 +83,7 @@ fn collect_chars(manifest_dir: &Path) -> io::Result<String> {
     add_ascii_chars(&mut set);
     add_chars(
         &mut set,
-        "，。！？、；：‘’“”【】（）《》〈〉—…·+-=*/_[]{}()<>|\\\"'`~!@#$%^&,:.;? ",
+        " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
     );
 
     collect_from_dir(&manifest_dir.join("src"), &mut set)?;
@@ -147,70 +153,28 @@ fn is_text_file(path: &Path) -> bool {
     )
 }
 
-fn generate_subset_font(source_font: &Path, text_file: &Path, output_font: &Path) -> io::Result<bool> {
-    let source = source_font.to_string_lossy().to_string();
-    let text = text_file.to_string_lossy().to_string();
-    let output = output_font.to_string_lossy().to_string();
-
-    let direct_output = Command::new("pyftsubset")
-        .arg(&source)
-        .arg(format!("--text-file={text}"))
-        .arg(format!("--output-file={output}"))
-        .arg("--no-hinting")
-        .output();
-    if let Ok(output_data) = direct_output {
-        if output_data.status.success() {
-            println!("cargo:warning=font subset generated with pyftsubset");
-            return Ok(true);
-        }
-        let stderr = String::from_utf8_lossy(&output_data.stderr);
-        println!("cargo:warning=pyftsubset failed: {}", stderr.trim());
+fn generate_subset_font_with_rust(source_font: &Path, chars: &str, output_font: &Path) -> io::Result<bool> {
+    if chars.is_empty() {
+        return Ok(false);
     }
 
-    let mut python_candidates: Vec<(String, Vec<String>)> = Vec::new();
-    if let Ok(python_env) = env::var("PYTHON") {
-        if !python_env.trim().is_empty() {
-            python_candidates.push((python_env, vec![]));
-        }
+    let font_bytes = fs::read(source_font)?;
+    let font = Font::opentype(&font_bytes).map_err(|error| io::Error::other(error.to_string()))?;
+
+    let mut retained_chars = BTreeSet::new();
+    for ch in chars.chars() {
+        retained_chars.insert(ch);
     }
-    python_candidates.push(("python".to_owned(), vec![]));
-    python_candidates.push(("py".to_owned(), vec!["-3".to_owned()]));
+    retained_chars.insert(' ');
 
-    for (command_name, prefix_args) in python_candidates {
-        let mut command = Command::new(&command_name);
-        for arg in &prefix_args {
-            command.arg(arg);
-        }
-        let output_data = command
-            .arg("-m")
-            .arg("fontTools.subset")
-            .arg(&source)
-            .arg(format!("--text-file={text}"))
-            .arg(format!("--output-file={output}"))
-            .arg("--no-hinting")
-            .output();
-
-        if let Ok(process_output) = output_data {
-            if process_output.status.success() {
-                println!(
-                    "cargo:warning=font subset generated with {} {}",
-                    command_name,
-                    if prefix_args.is_empty() {
-                        "-m fontTools.subset"
-                    } else {
-                        "-3 -m fontTools.subset"
-                    }
-                );
-                return Ok(true);
-            }
-            let stderr = String::from_utf8_lossy(&process_output.stderr);
-            println!(
-                "cargo:warning={} fontTools.subset failed: {}",
-                command_name,
-                stderr.trim()
-            );
-        }
+    let subset = font
+        .subset(&retained_chars)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let subset_bytes = subset.to_opentype();
+    if subset_bytes.is_empty() {
+        return Ok(false);
     }
 
-    Ok(false)
+    fs::write(output_font, subset_bytes)?;
+    Ok(true)
 }

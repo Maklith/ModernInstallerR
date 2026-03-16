@@ -4,51 +4,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Resolve-PythonCommand {
-    $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
-    if ($null -ne $pyLauncher) {
-        $pyExe = & py -3 -c "import sys; print(sys.executable)" 2>$null
-        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($pyExe)) {
-            return $pyExe.Trim()
-        }
-    }
-
-    $python = Get-Command python -ErrorAction SilentlyContinue
-    if ($null -ne $python) {
-        return $python.Source
-    }
-    return $null
-}
-
-function Ensure-FontTools {
-    $pythonCmd = Resolve-PythonCommand
-    if ([string]::IsNullOrWhiteSpace($pythonCmd)) {
-        Write-Warning "Python not found. Font subsetting will fallback to full font."
-        return
-    }
-
-    $env:PYTHON = $pythonCmd
-    & $pythonCmd -c "import fontTools" *> $null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "fontTools already available. (python: $pythonCmd)"
-        return
-    }
-
-    Write-Host "fontTools not found, installing..."
-    & $pythonCmd -m pip install --user fonttools
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "fontTools install failed. Font subsetting will fallback to full font."
-        return
-    }
-
-    & $pythonCmd -c "import fontTools" *> $null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "fontTools installed. (python: $pythonCmd)"
-    } else {
-        Write-Warning "fontTools verification failed. Font subsetting will fallback to full font."
-    }
-}
-
 function Copy-WithRetry {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
@@ -81,7 +36,6 @@ $profile = if ($Debug) { "debug" } else { "release" }
 
 Write-Host "Target architecture: $target"
 Write-Host "Build profile: $profile"
-Ensure-FontTools
 
 $uninstallerArgs = @("build", "--target", $target, "--bin", "modern_uninstaller_r")
 if (-not $Debug) { $uninstallerArgs += "--release" }
