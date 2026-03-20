@@ -203,6 +203,26 @@ impl eframe::App for InstallerApp {
                         });
                     });
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    if !self.show_detail && !self.is_update() {
+                        egui::TopBottomPanel::bottom("installer_before_more_options_inside")
+                            .resizable(false)
+                            .exact_height(28.0)
+                            .show_inside(ui, |ui| {
+                                ui.horizontal_centered(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                "更多安装选项",
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.show_detail = true;
+                                    }
+                                });
+                            });
+                    }
                     let validation_error =
                         self.validate_current().err().map(|error| error.to_string());
                     let can_install = validation_error.is_none();
@@ -248,13 +268,6 @@ impl eframe::App for InstallerApp {
                                     );
                                 }
                             });
-                            if !self.is_update()
-                                && ui
-                                    .add(egui::Button::new("更多安装选项").frame(false))
-                                    .clicked()
-                            {
-                                self.show_detail = !self.show_detail;
-                            }
                         } else {
                             ui.horizontal_centered(|ui| {
                                 ui.add_sized(
