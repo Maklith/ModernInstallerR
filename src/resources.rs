@@ -12,6 +12,7 @@ const EMBEDDED_UNINSTALLER_GZ: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/ModernInstaller.Uninstaller.exe.gz"
 ));
+const APP_LOGO_PNG: &[u8] = include_bytes!("../installer_assets/Icon.png");
 const INSTALLER_ICON_PNG: &[u8] = include_bytes!("../installer_assets/IconPack.png");
 const UNINSTALLER_ICON_PNG: &[u8] = include_bytes!("../installer_assets/IconUninstall.png");
 
@@ -41,6 +42,10 @@ pub fn embedded_info_json() -> &'static [u8] {
 
 pub fn embedded_uninstaller_gz() -> &'static [u8] {
     EMBEDDED_UNINSTALLER_GZ
+}
+
+pub fn app_logo_data() -> Result<IconData> {
+    eframe::icon_data::from_png_bytes(APP_LOGO_PNG).context("failed to decode app logo png")
 }
 
 pub fn installer_icon_data() -> Result<IconData> {

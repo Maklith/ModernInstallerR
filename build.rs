@@ -24,13 +24,14 @@ const APP_PACKAGE_CANDIDATES: &[(&str, AppPackageKind)] = &[
 ];
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
 
     let source_font = manifest_dir.join(SOURCE_FONT_REL);
     let source_uninstaller = manifest_dir.join(SOURCE_UNINSTALLER_REL);
-    let (source_app_package, app_package_kind) =
-        detect_app_package(&manifest_dir).expect("missing app package: expected App.zip/App.tar/App.tar.gz/App.tgz");
+    let (source_app_package, app_package_kind) = detect_app_package(&manifest_dir)
+        .expect("missing app package: expected App.zip/App.tar/App.tar.gz/App.tgz");
     let generated_font = out_dir.join(GENERATED_FONT_NAME);
     let generated_app_package_gz = out_dir.join(GENERATED_APP_PACKAGE_GZ_NAME);
     let generated_app_package_kind = out_dir.join(GENERATED_APP_PACKAGE_KIND_NAME);
@@ -51,11 +52,15 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
-        manifest_dir.join("installer_assets/Agreement.txt").display()
+        manifest_dir
+            .join("installer_assets/Agreement.txt")
+            .display()
     );
     println!(
         "cargo:rerun-if-changed={}",
-        manifest_dir.join("installer_assets/extra_chars.txt").display()
+        manifest_dir
+            .join("installer_assets/extra_chars.txt")
+            .display()
     );
     print_rerun_for_dir(&manifest_dir.join("src"));
 
@@ -123,16 +128,19 @@ fn print_rerun_for_dir(dir: &Path) {
 fn collect_chars(manifest_dir: &Path) -> io::Result<String> {
     let mut set = BTreeSet::new();
     add_ascii_chars(&mut set);
-    add_chars(
-        &mut set,
-        " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
-    );
+    add_chars(&mut set, " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~");
 
     collect_from_dir(&manifest_dir.join("src"), &mut set)?;
     collect_from_file(&manifest_dir.join("Cargo.toml"), &mut set)?;
     collect_from_file(&manifest_dir.join("installer_assets/info.json"), &mut set)?;
-    collect_from_file(&manifest_dir.join("installer_assets/Agreement.txt"), &mut set)?;
-    collect_from_file(&manifest_dir.join("installer_assets/extra_chars.txt"), &mut set)?;
+    collect_from_file(
+        &manifest_dir.join("installer_assets/Agreement.txt"),
+        &mut set,
+    )?;
+    collect_from_file(
+        &manifest_dir.join("installer_assets/extra_chars.txt"),
+        &mut set,
+    )?;
 
     Ok(set.into_iter().collect())
 }
@@ -195,7 +203,11 @@ fn is_text_file(path: &Path) -> bool {
     )
 }
 
-fn generate_subset_font_with_rust(source_font: &Path, chars: &str, output_font: &Path) -> io::Result<bool> {
+fn generate_subset_font_with_rust(
+    source_font: &Path,
+    chars: &str,
+    output_font: &Path,
+) -> io::Result<bool> {
     if chars.is_empty() {
         return Ok(false);
     }

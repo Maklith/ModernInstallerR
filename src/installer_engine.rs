@@ -13,14 +13,14 @@ use flate2::read::GzDecoder;
 use std::os::windows::process::CommandExt;
 use sysinfo::{ProcessesToUpdate, Signal, System};
 use winreg::RegKey;
-use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, KEY_WRITE};
 use zip::ZipArchive;
 
 use crate::model::InstallerInfo;
 use crate::resources;
 use crate::util::{
-    default_install_dir, escape_ps_single_quote, is_windows_64bit_os, normalize_path, path_has_any_content,
-    shortcut_paths,
+    default_install_dir_for_arch, escape_ps_single_quote, is_windows_64bit_os, normalize_path,
+    path_has_any_content, shortcut_paths,
 };
 use crate::version::LooseVersion;
 
@@ -45,21 +45,26 @@ pub struct UninstallTarget {
     pub app_name: String,
     pub install_path: PathBuf,
     pub main_file: String,
+    pub is_64: bool,
 }
 
 pub fn suggested_install_path(info: &InstallerInfo, existing: &ExistingInstall) -> PathBuf {
     existing
         .installed_path
         .clone()
-        .unwrap_or_else(|| default_install_dir(&info.display_name))
+        .unwrap_or_else(|| default_install_dir_for_arch(&info.display_name, info.is_64))
 }
 
-pub fn read_existing_install() -> ExistingInstall {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(root) = hkcu.open_subkey_with_flags(UNINSTALL_REGISTRY_ROOT, KEY_READ) else {
+pub fn read_existing_install(info: &InstallerInfo) -> ExistingInstall {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let Ok(root) =
+        hklm.open_subkey_with_flags(UNINSTALL_REGISTRY_ROOT, registry_read_flags(info.is_64))
+    else {
         return ExistingInstall::default();
     };
-    let Ok(entry) = root.open_subkey_with_flags(uninstall_entry_name(), KEY_READ) else {
+    let Ok(entry) =
+        root.open_subkey_with_flags(uninstall_entry_name(), registry_read_flags(info.is_64))
+    else {
         return ExistingInstall::default();
     };
 
@@ -106,10 +111,13 @@ pub fn validate_install(
     existing: &ExistingInstall,
 ) -> Result<()> {
     if info.is_64 && !is_windows_64bit_os() {
-        bail!("X86 架构无法安装 X64 程序");
+        bail!("X86架构无法安装X64程序");
     }
     if install_path.as_os_str().is_empty() {
         bail!("安装路径为空，请选择安装目录");
+    }
+    if !install_path.has_root() {
+        bail!("安装路径错误");
     }
     if install_path.exists() && path_has_any_content(install_path) && !is_update(info, existing) {
         bail!("安装路径不为空，请重新选择");
@@ -120,28 +128,34 @@ pub fn validate_install(
     Ok(())
 }
 
-pub fn run_install<F>(info: &InstallerInfo, install_path: &Path, mut report_progress: F) -> Result<InstallResult>
+pub fn run_install<F>(
+    info: &InstallerInfo,
+    install_path: &Path,
+    mut report_progress: F,
+) -> Result<InstallResult>
 where
     F: FnMut(u8),
 {
     report_progress(20);
     terminate_processes_by_path(&install_path.join(&info.can_execute_path))
-        .context("中止目标进程时出现错误, 安装被中止")?;
+        .context("中止目标进程时出现错误,安装被中止")?;
 
     report_progress(50);
-    extract_app_package(install_path).context("解压程序时出现错误, 安装被中止")?;
+    extract_app_package(install_path).context("解压程序时出现错误,安装被中止")?;
 
     report_progress(70);
-    write_install_support_files(install_path).context("创建卸载程序时出现错误, 安装被中止")?;
+    write_install_support_files(install_path).context("创建卸载程序时出现错误,安装被中止")?;
 
     report_progress(90);
-    write_registry_values(info, install_path).context("写入注册表时出现错误, 安装被中止")?;
-    create_or_replace_shortcuts(
-        &info.display_name,
-        &install_path.join(&info.can_execute_path),
-        install_path,
-    )
-    .context("创建快捷方式时出现错误, 安装被中止")?;
+    write_registry_values(info, install_path)
+        .and_then(|_| {
+            create_or_replace_shortcuts(
+                &info.display_name,
+                &install_path.join(&info.can_execute_path),
+                install_path,
+            )
+        })
+        .context("写入注册表或创建快捷方式时出现错误,安装被中止")?;
 
     report_progress(100);
     Ok(InstallResult {
@@ -151,7 +165,7 @@ where
 }
 
 pub fn resolve_uninstall_target(info: &InstallerInfo) -> Result<UninstallTarget> {
-    let existing = read_existing_install();
+    let existing = read_existing_install(info);
     let install_path = existing
         .installed_path
         .ok_or_else(|| anyhow::anyhow!("安装程序未找到"))?;
@@ -166,6 +180,7 @@ pub fn resolve_uninstall_target(info: &InstallerInfo) -> Result<UninstallTarget>
         app_name,
         install_path,
         main_file,
+        is_64: info.is_64,
     })
 }
 
@@ -175,14 +190,15 @@ where
 {
     report_progress(70);
     terminate_processes_by_path(&target.install_path.join(&target.main_file))
-        .context("中止目标进程时出现错误, 卸载被中止")?;
+        .context("中止目标进程时出现错误,卸载被中止")?;
 
     report_progress(50);
-    remove_install_directory(&target.install_path).context("文件删除时出现错误, 卸载被中止")?;
+    remove_install_directory(&target.install_path).context("文件删除时出现错误,卸载被中止")?;
 
     report_progress(0);
-    delete_registry_values().context("移除安装注册时出现问题, 卸载被中止")?;
-    remove_shortcuts(&target.app_name);
+    delete_registry_values(target.is_64).context("移除安装注册时出现问题,卸载被中止")?;
+    remove_shortcuts(&target.app_name)
+        .context("移除快捷方式时出现错误,卸载近乎完成,请手动删除快捷方式")?;
 
     Ok(())
 }
@@ -201,7 +217,8 @@ fn uninstall_entry_name() -> String {
 
 fn extract_app_package(install_path: &Path) -> Result<()> {
     fs::create_dir_all(install_path)?;
-    let package_payload = inflate_gzip_bytes(resources::app_package_gz()).context("invalid app package gzip stream")?;
+    let package_payload = inflate_gzip_bytes(resources::app_package_gz())
+        .context("invalid app package gzip stream")?;
     match resources::app_package_kind() {
         "zip" => extract_zip_package(install_path, &package_payload),
         "tar" => extract_tar_package(install_path, &package_payload),
@@ -261,13 +278,16 @@ fn extract_tar_gz_package(install_path: &Path, package_payload: &[u8]) -> Result
 }
 
 fn write_install_support_files(install_path: &Path) -> Result<()> {
-    let uninstaller_bytes =
-        inflate_gzip_bytes(resources::embedded_uninstaller_gz()).context("invalid uninstaller gzip stream")?;
+    let uninstaller_bytes = inflate_gzip_bytes(resources::embedded_uninstaller_gz())
+        .context("invalid uninstaller gzip stream")?;
     fs::write(
         install_path.join("ModernInstaller.Uninstaller.exe"),
         uninstaller_bytes,
     )?;
-    fs::write(install_path.join("info.json"), resources::embedded_info_json())?;
+    fs::write(
+        install_path.join("info.json"),
+        resources::embedded_info_json(),
+    )?;
     Ok(())
 }
 
@@ -279,8 +299,9 @@ fn inflate_gzip_bytes(gzip_bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn write_registry_values(info: &InstallerInfo, install_path: &Path) -> Result<()> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (root, _) = hkcu.create_subkey(UNINSTALL_REGISTRY_ROOT)?;
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let (root, _) =
+        hklm.create_subkey_with_flags(UNINSTALL_REGISTRY_ROOT, registry_write_flags(info.is_64))?;
     let (entry, _) = root.create_subkey(uninstall_entry_name())?;
 
     entry.set_value("DisplayName", &info.display_name)?;
@@ -297,7 +318,10 @@ fn write_registry_values(info: &InstallerInfo, install_path: &Path) -> Result<()
     entry.set_value("MainFile", &info.can_execute_path)?;
 
     let display_icon = if info.display_icon.trim().is_empty() {
-        format!("{},0", install_path.join(&info.can_execute_path).to_string_lossy())
+        format!(
+            "{},0",
+            install_path.join(&info.can_execute_path).to_string_lossy()
+        )
     } else {
         info.display_icon.clone()
     };
@@ -307,9 +331,10 @@ fn write_registry_values(info: &InstallerInfo, install_path: &Path) -> Result<()
     Ok(())
 }
 
-fn delete_registry_values() -> Result<()> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let root = hkcu.open_subkey_with_flags(UNINSTALL_REGISTRY_ROOT, KEY_WRITE)?;
+fn delete_registry_values(is_64_target: bool) -> Result<()> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let root =
+        hklm.open_subkey_with_flags(UNINSTALL_REGISTRY_ROOT, registry_write_flags(is_64_target))?;
     let _ = root.delete_subkey_all(uninstall_entry_name());
     Ok(())
 }
@@ -342,8 +367,12 @@ fn terminate_processes_by_path(executable_path: &Path) -> Result<()> {
     bail!("无法终止目标进程");
 }
 
-fn create_or_replace_shortcuts(app_name: &str, target_path: &Path, install_dir: &Path) -> Result<()> {
-    remove_shortcuts(app_name);
+fn create_or_replace_shortcuts(
+    app_name: &str,
+    target_path: &Path,
+    install_dir: &Path,
+) -> Result<()> {
+    remove_shortcuts(app_name)?;
     for shortcut in shortcut_paths(app_name) {
         if let Some(parent) = shortcut.parent() {
             let _ = fs::create_dir_all(parent);
@@ -353,12 +382,13 @@ fn create_or_replace_shortcuts(app_name: &str, target_path: &Path, install_dir: 
     Ok(())
 }
 
-fn remove_shortcuts(app_name: &str) {
+fn remove_shortcuts(app_name: &str) -> Result<()> {
     for shortcut in shortcut_paths(app_name) {
         if shortcut.exists() {
-            let _ = fs::remove_file(shortcut);
+            fs::remove_file(shortcut)?;
         }
     }
+    Ok(())
 }
 
 fn create_shortcut_with_powershell(
@@ -382,7 +412,14 @@ fn create_shortcut_with_powershell(
     );
 
     let status = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
         .status()?;
     if status.success() {
         Ok(())
@@ -419,4 +456,20 @@ fn schedule_directory_cleanup(install_path: &Path) -> Result<()> {
     }
     command.spawn()?;
     Ok(())
+}
+
+fn registry_view_flag(is_64_target: bool) -> u32 {
+    if is_64_target {
+        KEY_WOW64_64KEY
+    } else {
+        KEY_WOW64_32KEY
+    }
+}
+
+fn registry_read_flags(is_64_target: bool) -> u32 {
+    KEY_READ | registry_view_flag(is_64_target)
+}
+
+fn registry_write_flags(is_64_target: bool) -> u32 {
+    KEY_WRITE | registry_view_flag(is_64_target)
 }

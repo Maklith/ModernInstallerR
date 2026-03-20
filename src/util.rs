@@ -10,8 +10,19 @@ pub fn is_windows_64bit_os() -> bool {
 }
 
 pub fn default_install_dir(app_name: &str) -> PathBuf {
-    let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("C:\\Users\\Public\\AppData\\Local"));
-    base.join("Programs").join(app_name)
+    default_install_dir_for_arch(app_name, true)
+}
+
+pub fn default_install_dir_for_arch(app_name: &str, target_is_64: bool) -> PathBuf {
+    let base = if target_is_64 && is_windows_64bit_os() {
+        env::var_os("ProgramW6432").or_else(|| env::var_os("ProgramFiles"))
+    } else {
+        env::var_os("ProgramFiles(x86)").or_else(|| env::var_os("ProgramFiles"))
+    };
+    let base = base
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\Program Files"));
+    base.join(app_name)
 }
 
 pub fn path_has_any_content(path: &Path) -> bool {

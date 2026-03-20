@@ -42,7 +42,7 @@ struct InstallerApp {
 
 impl InstallerApp {
     fn new(info: InstallerInfo) -> Self {
-        let existing = installer_engine::read_existing_install();
+        let existing = installer_engine::read_existing_install(&info);
         let suggested_path = installer_engine::suggested_install_path(&info, &existing);
         Self {
             info,
@@ -64,7 +64,7 @@ impl InstallerApp {
         if self.logo_texture.is_some() {
             return;
         }
-        let Ok(icon_data) = resources::installer_icon_data() else {
+        let Ok(icon_data) = resources::app_logo_data() else {
             return;
         };
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
@@ -185,119 +185,152 @@ impl eframe::App for InstallerApp {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.phase {
+        match self.phase {
             InstallPhase::BeforeInstall => {
-                ui.vertical_centered(|ui| {
-                    let top_space = if self.show_detail { 72.0 } else { 92.0 };
-                    ui.add_space(top_space);
-                    self.show_logo(ui, 72.0);
-                    ui.add_space(10.0);
-                    ui.heading(RichText::new(&self.info.display_name).size(28.0));
-                    ui.add_space(6.0);
-
-                    if !self.show_detail {
-                        let button_label = if self.is_update() {
-                            "安装更新"
-                        } else {
-                            "一键安装"
-                        };
-                        if ui
-                            .add_sized([180.0, 42.0], egui::Button::new(button_label))
-                            .clicked()
-                        {
-                            self.start_install();
-                        }
-                        ui.add_space(8.0);
-                        if let Some(old_version) = self.existing.installed_version.as_ref() {
-                            let mut text = format!("已安装版本: {old_version}");
-                            if self.is_update() {
-                                text.push_str(&format!("  ->  {}", self.info.display_version));
-                            }
-                            ui.label(text);
-                        }
-                        if !self.is_update() && ui.link("更多安装选项").clicked() {
-                            self.show_detail = true;
-                        }
-                    } else {
+                egui::TopBottomPanel::bottom("installer_before_agreement")
+                    .resizable(false)
+                    .exact_height(42.0)
+                    .show(ctx, |ui| {
+                        ui.add_space(2.0);
                         ui.horizontal_centered(|ui| {
-                            ui.add_sized(
-                                [390.0, 32.0],
-                                egui::TextEdit::singleline(&mut self.install_path),
-                            );
-                            if ui.button("修改").clicked() {
-                                self.pick_folder();
+                            ui.checkbox(&mut self.agreed, "我已阅读并同意");
+                            if ui
+                                .add(egui::Button::new("《用户协议》").frame(false))
+                                .clicked()
+                            {
+                                self.show_agreement = true;
                             }
                         });
-                        ui.add_space(8.0);
-                        if ui
-                            .add_sized([180.0, 40.0], egui::Button::new("安装"))
-                            .clicked()
-                        {
-                            self.start_install();
-                        }
-                    }
+                    });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let validation_error =
+                        self.validate_current().err().map(|error| error.to_string());
+                    let can_install = validation_error.is_none();
+                    ui.add_space(60.0);
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        self.show_logo(ui, 96.0);
+                        ui.add_space(15.0);
+                        ui.label(RichText::new(&self.info.display_name).size(16.0));
+                        ui.add_space(5.0);
 
-                    ui.add_space(16.0);
-                    ui.horizontal_centered(|ui| {
-                        ui.checkbox(&mut self.agreed, "我已阅读并同意");
-                        if ui.link("《用户协议》").clicked() {
-                            self.show_agreement = true;
+                        if !self.show_detail {
+                            let button_label = if self.is_update() {
+                                "安装更新"
+                            } else {
+                                "一键安装"
+                            };
+                            if ui
+                                .add_enabled(
+                                    can_install,
+                                    egui::Button::new(button_label)
+                                        .min_size(egui::vec2(150.0, 40.0)),
+                                )
+                                .clicked()
+                            {
+                                self.start_install();
+                            }
+                            if let Some(error) = validation_error.as_ref() {
+                                ui.colored_label(Color32::from_rgb(196, 20, 20), error);
+                            }
+                            ui.horizontal_centered(|ui| {
+                                if let Some(old_version) = self.existing.installed_version.as_ref()
+                                {
+                                    ui.label(old_version.to_string());
+                                } else {
+                                    ui.label("");
+                                }
+                                if self.is_update() {
+                                    ui.colored_label(Color32::from_rgb(235, 132, 42), ">");
+                                    ui.colored_label(
+                                        Color32::from_rgb(235, 132, 42),
+                                        &self.info.display_version,
+                                    );
+                                }
+                            });
+                            if !self.is_update()
+                                && ui
+                                    .add(egui::Button::new("更多安装选项").frame(false))
+                                    .clicked()
+                            {
+                                self.show_detail = !self.show_detail;
+                            }
+                        } else {
+                            ui.horizontal_centered(|ui| {
+                                ui.add_sized(
+                                    [300.0, 32.0],
+                                    egui::TextEdit::singleline(&mut self.install_path),
+                                );
+                                if ui.button("修改").clicked() {
+                                    self.pick_folder();
+                                }
+                            });
+                            if let Some(error) = validation_error.as_ref() {
+                                ui.colored_label(Color32::from_rgb(196, 20, 20), error);
+                            }
+                            if ui
+                                .add_enabled(
+                                    can_install,
+                                    egui::Button::new("安装").min_size(egui::vec2(150.0, 40.0)),
+                                )
+                                .clicked()
+                            {
+                                self.start_install();
+                            }
+                        }
+
+                        if let Some(error) = self.error_text.as_ref() {
+                            ui.add_space(8.0);
+                            ui.colored_label(Color32::from_rgb(196, 20, 20), error);
                         }
                     });
-
-                    if let Err(error) = self.validate_current() {
-                        ui.add_space(8.0);
-                        ui.colored_label(Color32::from_rgb(196, 20, 20), error.to_string());
-                    }
-                    if let Some(error) = self.error_text.as_ref() {
-                        ui.add_space(8.0);
-                        ui.colored_label(Color32::from_rgb(196, 20, 20), error);
-                    }
                 });
             }
             InstallPhase::Installing => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(110.0);
-                    self.show_logo(ui, 64.0);
-                    ui.add_space(8.0);
-                    ui.heading("安装中...");
-                    ui.add_space(10.0);
-                    ui.add(
-                        egui::ProgressBar::new(self.progress as f32 / 100.0)
-                            .show_percentage()
-                            .desired_width(420.0),
-                    );
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(130.0);
+                        ui.heading("安装中..");
+                        ui.add_space(10.0);
+                        ui.add(
+                            egui::ProgressBar::new(self.progress as f32 / 100.0)
+                                .show_percentage()
+                                .desired_width(300.0),
+                        );
+                    });
                 });
             }
             InstallPhase::AfterInstall => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(110.0);
-                    self.show_logo(ui, 64.0);
-                    ui.add_space(8.0);
-                    ui.heading(format!("{} 安装完成", self.info.display_name));
-                    ui.add_space(18.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_sized([140.0, 38.0], egui::Button::new("完成安装"))
-                            .clicked()
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if ui
-                            .add_sized([140.0, 38.0], egui::Button::new("立即体验"))
-                            .clicked()
-                        {
-                            self.launch_application();
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        self.show_logo(ui, 96.0);
+                        ui.add_space(15.0);
+                        ui.label(RichText::new(&self.info.display_name).size(16.0));
+                        ui.add_space(5.0);
+                        ui.horizontal_centered(|ui| {
+                            if ui
+                                .add_sized([150.0, 40.0], egui::Button::new("完成安装"))
+                                .clicked()
+                            {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            if ui
+                                .add_sized([150.0, 40.0], egui::Button::new("立即体验"))
+                                .clicked()
+                            {
+                                self.launch_application();
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                        if let Some(error) = self.error_text.as_ref() {
+                            ui.add_space(8.0);
+                            ui.colored_label(Color32::from_rgb(196, 20, 20), error);
                         }
                     });
-                    if let Some(error) = self.error_text.as_ref() {
-                        ui.add_space(8.0);
-                        ui.colored_label(Color32::from_rgb(196, 20, 20), error);
-                    }
                 });
             }
-        });
+        }
 
         if self.show_agreement {
             egui::Window::new("用户协议")
@@ -316,7 +349,7 @@ impl eframe::App for InstallerApp {
 
 fn run_silent_install() -> Result<()> {
     let info = resources::installer_info()?;
-    let existing = installer_engine::read_existing_install();
+    let existing = installer_engine::read_existing_install(&info);
     let install_path = installer_engine::suggested_install_path(&info, &existing);
     installer_engine::validate_install(&info, &install_path, true, &existing)?;
     let result = installer_engine::run_install(&info, &install_path, |_| {})?;
@@ -339,7 +372,7 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("ModernInstaller")
-            .with_inner_size([640.0, 420.0])
+            .with_inner_size([600.0, 370.0])
             .with_resizable(false)
             .with_icon(installer_icon),
         centered: true,

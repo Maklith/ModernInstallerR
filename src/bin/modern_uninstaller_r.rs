@@ -63,7 +63,7 @@ impl UninstallerApp {
         if self.logo_texture.is_some() {
             return;
         }
-        let Ok(icon_data) = resources::uninstaller_icon_data() else {
+        let Ok(icon_data) = resources::app_logo_data() else {
             return;
         };
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
@@ -146,17 +146,17 @@ impl eframe::App for UninstallerApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.phase {
             UninstallPhase::BeforeUninstall => {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(110.0);
-                    self.show_logo(ui, 64.0);
-                    ui.add_space(8.0);
-                    ui.heading(RichText::new(&self.app_name).size(28.0));
-                    ui.add_space(14.0);
+                    ui.add_space(80.0);
+                    self.show_logo(ui, 96.0);
+                    ui.add_space(15.0);
+                    ui.label(RichText::new(&self.app_name).size(16.0));
+                    ui.add_space(5.0);
                     let enabled = self.target.is_some();
                     if ui
                         .add_enabled(
                             enabled,
                             egui::Button::new(RichText::new("卸载程序").color(Color32::WHITE))
-                                .min_size([170.0, 42.0].into())
+                                .min_size([150.0, 40.0].into())
                                 .fill(Color32::from_rgb(175, 28, 28)),
                         )
                         .clicked()
@@ -171,28 +171,30 @@ impl eframe::App for UninstallerApp {
             }
             UninstallPhase::Uninstalling => {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(110.0);
-                    self.show_logo(ui, 60.0);
-                    ui.add_space(8.0);
-                    ui.heading("卸载中...");
+                    ui.add_space(130.0);
+                    ui.heading("卸载中..");
                     ui.add_space(10.0);
                     let finished = 100 - self.remaining_progress;
                     ui.add(
                         egui::ProgressBar::new(finished as f32 / 100.0)
                             .show_percentage()
-                            .desired_width(420.0),
+                            .desired_width(300.0),
                     );
                 });
             }
             UninstallPhase::AfterUninstall => {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(130.0);
-                    self.show_logo(ui, 60.0);
-                    ui.add_space(8.0);
-                    ui.heading(format!("{} 已卸载", self.app_name));
-                    ui.add_space(14.0);
+                    ui.add_space(80.0);
+                    self.show_logo(ui, 96.0);
+                    ui.add_space(15.0);
+                    ui.label(RichText::new(&self.app_name).size(16.0));
+                    ui.add_space(5.0);
                     if ui
-                        .add_sized([160.0, 40.0], egui::Button::new("完成卸载"))
+                        .add_sized(
+                            [150.0, 40.0],
+                            egui::Button::new(RichText::new("完成卸载").color(Color32::WHITE))
+                                .fill(Color32::from_rgb(175, 28, 28)),
+                        )
                         .clicked()
                     {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -224,15 +226,15 @@ fn main() -> eframe::Result {
         resources::uninstaller_icon_data().expect("failed to load uninstaller icon");
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_title("ModernUninstaller")
-            .with_inner_size([620.0, 380.0])
+            .with_title("ModernInstaller")
+            .with_inner_size([600.0, 370.0])
             .with_resizable(false)
             .with_icon(uninstaller_icon),
         centered: true,
         ..Default::default()
     };
     eframe::run_native(
-        "ModernUninstaller",
+        "ModernInstaller",
         native_options,
         Box::new(move |cc| {
             ui_fonts::apply_harmony_font(&cc.egui_ctx);
