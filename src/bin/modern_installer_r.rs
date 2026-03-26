@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use eframe::egui::{self, Color32, RichText, ViewportBuilder};
+use eframe::egui::{self, Color32, RichText, ViewportBuilder, Widget};
 
 use modern_installer_r::installer_engine::{self, ExistingInstall, InstallResult};
 use modern_installer_r::model::InstallerInfo;
@@ -203,26 +203,6 @@ impl eframe::App for InstallerApp {
                         });
                     });
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    if !self.show_detail && !self.is_update() {
-                        egui::TopBottomPanel::bottom("installer_before_more_options_inside")
-                            .resizable(false)
-                            .exact_height(28.0)
-                            .show_inside(ui, |ui| {
-                                ui.horizontal_centered(|ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                "更多安装选项",
-                                            )
-                                            .frame(false),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.show_detail = true;
-                                    }
-                                });
-                            });
-                    }
                     let validation_error =
                         self.validate_current().err().map(|error| error.to_string());
                     let can_install = validation_error.is_none();
@@ -230,7 +210,7 @@ impl eframe::App for InstallerApp {
                     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.y = 5.0;
                         self.show_logo(ui, 96.0);
-                        ui.add_space(15.0);
+                        ui.add_space(10.0);
                         ui.label(RichText::new(&self.info.display_name).size(16.0));
                         ui.add_space(5.0);
 
@@ -267,29 +247,52 @@ impl eframe::App for InstallerApp {
                                         &self.info.display_version,
                                     );
                                 }
+                                ui.vertical_centered(|ui| {
+                                    let show_detail = egui::Button::new(
+                                        "更多安装选项",
+                                    );
+                                    if show_detail.ui(ui).clicked()
+                                    {
+                                        self.show_detail = true;
+                                    }
+                                });
+
                             });
+
                         } else {
-                            ui.horizontal_centered(|ui| {
-                                ui.add_sized(
-                                    [300.0, 32.0],
-                                    egui::TextEdit::singleline(&mut self.install_path),
-                                );
+                            ui.horizontal(|ui| {
+                                // 1. 计算内容总宽度 (输入框 300 + 间距 + 按钮宽度约 44)
+                                let content_width = 300.0 + ui.spacing().item_spacing.x + 44.0;
+
+                                // 2. 计算左侧需要的空白间距
+                                let gap = (ui.available_width() - content_width) / 2.0;
+
+                                if gap > 0.0 {
+                                    // 分配并占位，但不画任何东西
+                                    ui.allocate_space(egui::vec2(gap, 0.0));
+                                }
+
+                                // 3. 放置实际组件
+                                ui.add_sized([300.0, 20.0], egui::TextEdit::singleline(&mut self.install_path));
                                 if ui.button("修改").clicked() {
                                     self.pick_folder();
                                 }
                             });
-                            if let Some(error) = validation_error.as_ref() {
-                                ui.colored_label(Color32::from_rgb(196, 20, 20), error);
-                            }
-                            if ui
-                                .add_enabled(
-                                    can_install,
-                                    egui::Button::new("安装").min_size(egui::vec2(150.0, 40.0)),
-                                )
-                                .clicked()
-                            {
-                                self.start_install();
-                            }
+                            ui.vertical_centered(|ui| {
+                                if let Some(error) = validation_error.as_ref() {
+                                    ui.colored_label(Color32::from_rgb(196, 20, 20), error);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        can_install,
+                                        egui::Button::new("安装").min_size(egui::vec2(150.0, 40.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_install();
+                                }
+                            });
+
                         }
 
                         if let Some(error) = self.error_text.as_ref() {
