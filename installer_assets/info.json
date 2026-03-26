@@ -4,5 +4,15 @@
   "DisplayVersion": "0.1.0.0",
   "Publisher": "MakesYT",
   "CanExecutePath": "KitopiaAvalonia.exe",
-  "Is64": true
+  "Is64": true,
+  "InstallPackages": [
+    {
+      "Package": "App.zip",
+      "Target": "{InstallDir}"
+    },
+    {
+      "Package": "plugins.zip",
+      "Target": "{localUserData}\\Kitopia\\plugins"
+    }
+  ]
 }

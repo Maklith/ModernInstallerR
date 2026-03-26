@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use flate2::Compression;
@@ -11,40 +13,29 @@ use font_subset::Font;
 
 const SOURCE_FONT_REL: &str = "installer_assets/HarmonyOS_Sans_SC_Regular.ttf";
 const SOURCE_UNINSTALLER_REL: &str = "installer_assets/ModernInstaller.Uninstaller.exe";
+const PACKAGE_SOURCE_DIR_REL: &str = "installer_assets";
 const GENERATED_FONT_NAME: &str = "HarmonyOS_Sans_SC_Subset.ttf";
-const GENERATED_APP_PACKAGE_GZ_NAME: &str = "App.package.gz";
-const GENERATED_APP_PACKAGE_KIND_NAME: &str = "App.package.kind";
+const GENERATED_EMBEDDED_PACKAGES_RS_NAME: &str = "embedded_packages.rs";
 const GENERATED_UNINSTALLER_GZ_NAME: &str = "ModernInstaller.Uninstaller.exe.gz";
 const GENERATED_TEXT_NAME: &str = "font_chars.txt";
-const APP_PACKAGE_CANDIDATES: &[(&str, AppPackageKind)] = &[
-    ("installer_assets/App.zip", AppPackageKind::Zip),
-    ("installer_assets/App.tar", AppPackageKind::Tar),
-    ("installer_assets/App.tar.gz", AppPackageKind::TarGz),
-    ("installer_assets/App.tgz", AppPackageKind::TarGz),
-];
 
 fn main() {
+    if env::var("CARGO_CFG_WINDOWS").is_ok() {
+        embed_resource::compile("resources.rc", embed_resource::NONE);
+    }
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
 
     let source_font = manifest_dir.join(SOURCE_FONT_REL);
     let source_uninstaller = manifest_dir.join(SOURCE_UNINSTALLER_REL);
-    let (source_app_package, app_package_kind) = detect_app_package(&manifest_dir)
-        .expect("missing app package: expected App.zip/App.tar/App.tar.gz/App.tgz");
+    let package_source_dir = manifest_dir.join(PACKAGE_SOURCE_DIR_REL);
     let generated_font = out_dir.join(GENERATED_FONT_NAME);
-    let generated_app_package_gz = out_dir.join(GENERATED_APP_PACKAGE_GZ_NAME);
-    let generated_app_package_kind = out_dir.join(GENERATED_APP_PACKAGE_KIND_NAME);
+    let generated_embedded_packages_rs = out_dir.join(GENERATED_EMBEDDED_PACKAGES_RS_NAME);
     let generated_uninstaller_gz = out_dir.join(GENERATED_UNINSTALLER_GZ_NAME);
     let generated_text = out_dir.join(GENERATED_TEXT_NAME);
 
     println!("cargo:rerun-if-changed={}", source_font.display());
-    for (candidate, _) in APP_PACKAGE_CANDIDATES {
-        println!(
-            "cargo:rerun-if-changed={}",
-            manifest_dir.join(candidate).display()
-        );
-    }
     println!("cargo:rerun-if-changed={}", source_uninstaller.display());
     println!(
         "cargo:rerun-if-changed={}",
@@ -84,16 +75,31 @@ fn main() {
         println!("cargo:warning=using full Harmony font because Rust subsetting failed");
     }
 
-    let app_stats = gzip_file(&source_app_package, &generated_app_package_gz)
-        .expect("failed to gzip embedded app package");
-    fs::write(&generated_app_package_kind, app_package_kind.as_str())
-        .expect("failed to write app package kind");
-    println!(
-        "cargo:warning=embedded app package ({}) compressed {} -> {} bytes",
-        app_package_kind.as_str(),
-        app_stats.source_len,
-        app_stats.gz_len
-    );
+    let packages = collect_app_packages(&package_source_dir)
+        .expect("failed to scan installer_assets for archive packages");
+    if packages.is_empty() {
+        panic!(
+            "missing app package: expected at least one archive in installer_assets (*.zip/*.tar/*.tar.gz/*.tgz)"
+        );
+    }
+    for package in &packages {
+        println!("cargo:rerun-if-changed={}", package.source_path.display());
+    }
+
+    let generated_packages =
+        gzip_packages(&packages, &out_dir).expect("failed to gzip embedded app packages");
+    write_embedded_packages_rs(&generated_embedded_packages_rs, &generated_packages)
+        .expect("failed to write embedded packages metadata");
+    for package in &generated_packages {
+        println!(
+            "cargo:warning=embedded package {} ({}) compressed {} -> {} bytes",
+            package.file_name,
+            package.kind.as_str(),
+            package.source_len,
+            package.gz_len
+        );
+    }
+
     let uninstaller_stats = gzip_file(&source_uninstaller, &generated_uninstaller_gz)
         .expect("failed to gzip embedded uninstaller payload");
     println!(
@@ -233,6 +239,102 @@ fn generate_subset_font_with_rust(
     Ok(true)
 }
 
+#[derive(Clone)]
+struct PackageSource {
+    source_path: PathBuf,
+    file_name: String,
+    kind: AppPackageKind,
+}
+
+struct GeneratedPackage {
+    file_name: String,
+    kind: AppPackageKind,
+    source_len: usize,
+    gz_len: usize,
+    generated_gz_name: String,
+}
+
+fn collect_app_packages(package_dir: &Path) -> io::Result<Vec<PackageSource>> {
+    if !package_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut packages = Vec::new();
+    for entry in fs::read_dir(package_dir)? {
+        let path = entry?.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let file_name = file_name.to_owned();
+        let Some(kind) = detect_archive_kind(&file_name) else {
+            continue;
+        };
+        packages.push(PackageSource {
+            source_path: path,
+            file_name,
+            kind,
+        });
+    }
+
+    packages.sort_by(|left, right| {
+        left.file_name
+            .to_ascii_lowercase()
+            .cmp(&right.file_name.to_ascii_lowercase())
+    });
+    Ok(packages)
+}
+
+fn detect_archive_kind(file_name: &str) -> Option<AppPackageKind> {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        return Some(AppPackageKind::TarGz);
+    }
+    if lower.ends_with(".zip") {
+        return Some(AppPackageKind::Zip);
+    }
+    if lower.ends_with(".tar") {
+        return Some(AppPackageKind::Tar);
+    }
+    None
+}
+
+fn gzip_packages(packages: &[PackageSource], out_dir: &Path) -> io::Result<Vec<GeneratedPackage>> {
+    let mut generated = Vec::with_capacity(packages.len());
+    for (index, package) in packages.iter().enumerate() {
+        let generated_gz_name = format!("Package.{index}.gz");
+        let generated_gz_path = out_dir.join(&generated_gz_name);
+        let stats = gzip_file(&package.source_path, &generated_gz_path)?;
+        generated.push(GeneratedPackage {
+            file_name: package.file_name.clone(),
+            kind: package.kind,
+            source_len: stats.source_len,
+            gz_len: stats.gz_len,
+            generated_gz_name,
+        });
+    }
+    Ok(generated)
+}
+
+fn write_embedded_packages_rs(output_path: &Path, packages: &[GeneratedPackage]) -> io::Result<()> {
+    let mut source = String::from("pub static EMBEDDED_PACKAGES: &[EmbeddedPackage] = &[\n");
+    for package in packages {
+        writeln!(
+            source,
+            "    EmbeddedPackage {{ file_name: {:?}, kind: {:?}, gzip_bytes: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{}\")) }},",
+            package.file_name,
+            package.kind.as_str(),
+            package.generated_gz_name
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    }
+    source.push_str("];\n");
+    fs::write(output_path, source)?;
+    Ok(())
+}
+
 struct GzipStats {
     source_len: usize,
     gz_len: usize,
@@ -248,16 +350,6 @@ fn gzip_file(source_path: &Path, output_path: &Path) -> io::Result<GzipStats> {
         source_len: source.len(),
         gz_len: compressed.len(),
     })
-}
-
-fn detect_app_package(manifest_dir: &Path) -> Option<(PathBuf, AppPackageKind)> {
-    for (relative_path, kind) in APP_PACKAGE_CANDIDATES {
-        let full_path = manifest_dir.join(relative_path);
-        if full_path.exists() {
-            return Some((full_path, *kind));
-        }
-    }
-    None
 }
 
 #[derive(Copy, Clone)]

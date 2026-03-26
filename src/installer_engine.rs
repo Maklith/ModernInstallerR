@@ -17,7 +17,7 @@ use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64K
 use zip::ZipArchive;
 
 use crate::model::InstallerInfo;
-use crate::resources;
+use crate::resources::{self, EmbeddedPackage};
 use crate::util::{
     default_install_dir_for_arch, escape_ps_single_quote, is_windows_64bit_os, normalize_path,
     path_has_any_content, shortcut_paths,
@@ -141,7 +141,8 @@ where
         .context("中止目标进程时出现错误,安装被中止")?;
 
     report_progress(50);
-    extract_app_package(install_path).context("解压程序时出现错误,安装被中止")?;
+    extract_configured_packages(info, install_path)
+        .context("解压程序时出现错误,安装被中止")?;
 
     report_progress(70);
     write_install_support_files(install_path).context("创建卸载程序时出现错误,安装被中止")?;
@@ -197,8 +198,7 @@ where
 
     report_progress(0);
     delete_registry_values(target.is_64).context("移除安装注册时出现问题,卸载被中止")?;
-    remove_shortcuts(&target.app_name)
-        .context("移除快捷方式时出现错误,卸载近乎完成,请手动删除快捷方式")?;
+    remove_shortcuts(&target.app_name).context("移除快捷方式时出现错误,卸载近乎完成,请手动删除快捷方式")?;
 
     Ok(())
 }
@@ -215,19 +215,181 @@ fn uninstall_entry_name() -> String {
     format!("{{{}}}_ModernInstaller", resources::application_uuid())
 }
 
-fn extract_app_package(install_path: &Path) -> Result<()> {
+fn extract_configured_packages(info: &InstallerInfo, install_path: &Path) -> Result<()> {
     fs::create_dir_all(install_path)?;
-    let package_payload = inflate_gzip_bytes(resources::app_package_gz())
-        .context("invalid app package gzip stream")?;
-    match resources::app_package_kind() {
-        "zip" => extract_zip_package(install_path, &package_payload),
-        "tar" => extract_tar_package(install_path, &package_payload),
-        "tar.gz" => extract_tar_gz_package(install_path, &package_payload),
-        unknown => bail!("unsupported app package kind: {unknown}"),
+
+    if info.install_packages.is_empty() {
+        return extract_legacy_default_package(install_path);
+    }
+
+    for rule in &info.install_packages {
+        let package_name = rule.package.trim();
+        if package_name.is_empty() {
+            bail!("InstallPackages contains an empty Package value");
+        }
+
+        let package = resources::find_embedded_package(package_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "embedded package not found: {} (available: {})",
+                package_name,
+                available_package_names()
+            )
+        })?;
+        let target_dir = resolve_package_target(&rule.target, install_path, info)
+            .with_context(|| format!("invalid target for package {}", package.file_name))?;
+        extract_embedded_package(package, &target_dir).with_context(|| {
+            format!(
+                "failed to extract package {} to {}",
+                package.file_name,
+                target_dir.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn extract_legacy_default_package(install_path: &Path) -> Result<()> {
+    let package = resources::legacy_app_package()
+        .or_else(|| resources::embedded_packages().first())
+        .ok_or_else(|| anyhow::anyhow!("no embedded archive package found"))?;
+    extract_embedded_package(package, install_path).with_context(|| {
+        format!(
+            "failed to extract default package {} to {}",
+            package.file_name,
+            install_path.display()
+        )
+    })
+}
+
+fn available_package_names() -> String {
+    resources::embedded_packages()
+        .iter()
+        .map(|package| package.file_name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn resolve_package_target(
+    raw_target: &str,
+    install_path: &Path,
+    info: &InstallerInfo,
+) -> Result<PathBuf> {
+    let raw_target = raw_target.trim();
+    if raw_target.is_empty() {
+        bail!("target path template is empty");
+    }
+
+    let install_dir = install_path.to_string_lossy().to_string();
+    let mut resolved = raw_target.to_owned();
+
+    replace_placeholder_case_insensitive(&mut resolved, "{InstallDir}", &install_dir);
+    replace_placeholder_case_insensitive(&mut resolved, "{InstallPath}", &install_dir);
+    replace_placeholder_case_insensitive(&mut resolved, "{DisplayName}", &info.display_name);
+
+    replace_env_placeholder(&mut resolved, "{LocalUserData}", "LOCALAPPDATA")?;
+    replace_env_placeholder(&mut resolved, "{LocalAppData}", "LOCALAPPDATA")?;
+    replace_env_placeholder(&mut resolved, "%LOCALAPPDATA%", "LOCALAPPDATA")?;
+
+    replace_env_placeholder(&mut resolved, "{AppData}", "APPDATA")?;
+    replace_env_placeholder(&mut resolved, "{RoamingAppData}", "APPDATA")?;
+    replace_env_placeholder(&mut resolved, "%APPDATA%", "APPDATA")?;
+
+    replace_env_placeholder(&mut resolved, "{ProgramData}", "ProgramData")?;
+    replace_env_placeholder(&mut resolved, "%ProgramData%", "ProgramData")?;
+
+    replace_env_placeholder(&mut resolved, "{UserProfile}", "USERPROFILE")?;
+    replace_env_placeholder(&mut resolved, "%USERPROFILE%", "USERPROFILE")?;
+
+    replace_placeholder_case_insensitive(
+        &mut resolved,
+        "{Temp}",
+        &env::temp_dir().to_string_lossy(),
+    );
+
+    if has_unresolved_brace_placeholder(&resolved) {
+        bail!("unknown placeholder in target path: {raw_target}");
+    }
+
+    let mut target_path = PathBuf::from(resolved.trim());
+    if target_path.as_os_str().is_empty() {
+        bail!("resolved target path is empty");
+    }
+    if !target_path.is_absolute() {
+        target_path = install_path.join(target_path);
+    }
+
+    Ok(target_path)
+}
+
+fn replace_env_placeholder(target: &mut String, placeholder: &str, env_name: &str) -> Result<()> {
+    if !contains_ignore_ascii_case(target, placeholder) {
+        return Ok(());
+    }
+    let Some(value) = env::var_os(env_name) else {
+        bail!("placeholder {placeholder} requires environment variable {env_name}");
+    };
+    let value = PathBuf::from(value).to_string_lossy().to_string();
+    replace_placeholder_case_insensitive(target, placeholder, &value);
+    Ok(())
+}
+
+fn contains_ignore_ascii_case(input: &str, pattern: &str) -> bool {
+    input
+        .to_ascii_lowercase()
+        .contains(&pattern.to_ascii_lowercase())
+}
+
+fn replace_placeholder_case_insensitive(target: &mut String, placeholder: &str, replacement: &str) {
+    let placeholder_lower = placeholder.to_ascii_lowercase();
+    let mut remaining = target.as_str();
+    let mut output = String::with_capacity(target.len().max(replacement.len()));
+
+    loop {
+        let lower_remaining = remaining.to_ascii_lowercase();
+        let Some(index) = lower_remaining.find(&placeholder_lower) else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..index]);
+        output.push_str(replacement);
+        remaining = &remaining[index + placeholder.len()..];
+    }
+
+    *target = output;
+}
+
+fn has_unresolved_brace_placeholder(input: &str) -> bool {
+    let mut opened = false;
+    for ch in input.chars() {
+        if ch == '{' {
+            opened = true;
+            continue;
+        }
+        if ch == '}' && opened {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_embedded_package(package: &EmbeddedPackage, target_dir: &Path) -> Result<()> {
+    fs::create_dir_all(target_dir)?;
+    let package_payload = inflate_gzip_bytes(package.gzip_bytes)
+        .with_context(|| format!("invalid gzip stream for {}", package.file_name))?;
+
+    match package.kind {
+        "zip" => extract_zip_package(target_dir, &package_payload),
+        "tar" => extract_tar_package(target_dir, &package_payload),
+        "tar.gz" => extract_tar_gz_package(target_dir, &package_payload),
+        unknown => bail!(
+            "unsupported package kind for {}: {unknown}",
+            package.file_name
+        ),
     }
 }
 
-fn extract_zip_package(install_path: &Path, package_payload: &[u8]) -> Result<()> {
+fn extract_zip_package(target_dir: &Path, package_payload: &[u8]) -> Result<()> {
     let reader = Cursor::new(package_payload);
     let mut archive = ZipArchive::new(reader).context("invalid zip package data")?;
 
@@ -236,7 +398,7 @@ fn extract_zip_package(install_path: &Path, package_payload: &[u8]) -> Result<()
         let Some(relative_path) = file.enclosed_name() else {
             continue;
         };
-        let output_path = install_path.join(relative_path);
+        let output_path = target_dir.join(relative_path);
         if file.name().ends_with('/') {
             fs::create_dir_all(&output_path)?;
             continue;
@@ -252,25 +414,25 @@ fn extract_zip_package(install_path: &Path, package_payload: &[u8]) -> Result<()
     Ok(())
 }
 
-fn extract_tar_package(install_path: &Path, package_payload: &[u8]) -> Result<()> {
+fn extract_tar_package(target_dir: &Path, package_payload: &[u8]) -> Result<()> {
     let reader = Cursor::new(package_payload);
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if !entry.unpack_in(install_path)? {
+        if !entry.unpack_in(target_dir)? {
             bail!("invalid path in tar package");
         }
     }
     Ok(())
 }
 
-fn extract_tar_gz_package(install_path: &Path, package_payload: &[u8]) -> Result<()> {
+fn extract_tar_gz_package(target_dir: &Path, package_payload: &[u8]) -> Result<()> {
     let reader = Cursor::new(package_payload);
     let decoder = GzDecoder::new(reader);
     let mut archive = tar::Archive::new(decoder);
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if !entry.unpack_in(install_path)? {
+        if !entry.unpack_in(target_dir)? {
             bail!("invalid path in tar.gz package");
         }
     }
@@ -364,7 +526,7 @@ fn terminate_processes_by_path(executable_path: &Path) -> Result<()> {
         }
         thread::sleep(Duration::from_secs(1));
     }
-    bail!("无法终止目标进程");
+    bail!("failed to terminate target process");
 }
 
 fn create_or_replace_shortcuts(

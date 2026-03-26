@@ -32,6 +32,7 @@ zip = { version = "8.2", default-features = false, features = ["deflate"] }
 [build-dependencies]
 font-subset = "0.1.0"
 flate2 = "1.1"
+embed-resource = "2.5"
 
 [profile.release]
 opt-level = "z"

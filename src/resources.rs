@@ -6,8 +6,6 @@ use crate::model::InstallerInfo;
 const INFO_JSON: &str = include_str!("../installer_assets/info.json");
 const AGREEMENT_TEXT: &str = include_str!("../installer_assets/Agreement.txt");
 const APPLICATION_UUID: &str = include_str!("../installer_assets/ApplicationUUID");
-const APP_PACKAGE_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/App.package.gz"));
-const APP_PACKAGE_KIND: &str = include_str!(concat!(env!("OUT_DIR"), "/App.package.kind"));
 const EMBEDDED_UNINSTALLER_GZ: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/ModernInstaller.Uninstaller.exe.gz"
@@ -16,16 +14,36 @@ const APP_LOGO_PNG: &[u8] = include_bytes!("../installer_assets/Icon.png");
 const INSTALLER_ICON_PNG: &[u8] = include_bytes!("../installer_assets/IconPack.png");
 const UNINSTALLER_ICON_PNG: &[u8] = include_bytes!("../installer_assets/IconUninstall.png");
 
+#[derive(Clone, Copy, Debug)]
+pub struct EmbeddedPackage {
+    pub file_name: &'static str,
+    pub kind: &'static str,
+    pub gzip_bytes: &'static [u8],
+}
+
+include!(concat!(env!("OUT_DIR"), "/embedded_packages.rs"));
+
 pub fn installer_info() -> Result<InstallerInfo> {
     serde_json::from_str(INFO_JSON).context("failed to parse installer info.json")
 }
 
-pub fn app_package_gz() -> &'static [u8] {
-    APP_PACKAGE_GZ
+pub fn embedded_packages() -> &'static [EmbeddedPackage] {
+    EMBEDDED_PACKAGES
 }
 
-pub fn app_package_kind() -> &'static str {
-    APP_PACKAGE_KIND.trim()
+pub fn find_embedded_package(file_name: &str) -> Option<&'static EmbeddedPackage> {
+    embedded_packages()
+        .iter()
+        .find(|package| package.file_name.eq_ignore_ascii_case(file_name))
+}
+
+pub fn legacy_app_package() -> Option<&'static EmbeddedPackage> {
+    embedded_packages().iter().find(|package| {
+        matches!(
+            package.file_name.to_ascii_lowercase().as_str(),
+            "app.zip" | "app.tar" | "app.tar.gz" | "app.tgz"
+        )
+    })
 }
 
 pub fn agreement_text() -> &'static str {

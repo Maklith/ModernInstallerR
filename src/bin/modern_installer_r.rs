@@ -324,21 +324,35 @@ impl eframe::App for InstallerApp {
                         ui.add_space(15.0);
                         ui.label(RichText::new(&self.info.display_name).size(16.0));
                         ui.add_space(5.0);
-                        ui.horizontal_centered(|ui| {
-                            if ui
-                                .add_sized([150.0, 40.0], egui::Button::new("完成安装"))
-                                .clicked()
-                            {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ui.horizontal(|ui| {
+                            // 1. 计算内容总宽度 (输入框 300 + 间距 + 按钮宽度约 44)
+                            let content_width = 300.0 + ui.spacing().item_spacing.x + 44.0;
+
+                            // 2. 计算左侧需要的空白间距
+                            let gap = (ui.available_width() - content_width) / 2.0;
+
+                            if gap > 0.0 {
+                                // 分配并占位，但不画任何东西
+                                ui.allocate_space(egui::vec2(gap, 0.0));
                             }
-                            if ui
-                                .add_sized([150.0, 40.0], egui::Button::new("立即体验"))
-                                .clicked()
-                            {
-                                self.launch_application();
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
+
+                            // 3. 放置实际组件
+                            ui.horizontal(|ui| {
+                                if ui.add_sized([150.0, 40.0], egui::Button::new("完成安装")).clicked() {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+
+                                // 按钮之间的间距由 ui.spacing().item_spacing 自动处理
+
+                                if ui.add_sized([150.0, 40.0], egui::Button::new("立即体验")).clicked() {
+                                    self.launch_application();
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            });
                         });
+
+
+
                         if let Some(error) = self.error_text.as_ref() {
                             ui.add_space(8.0);
                             ui.colored_label(Color32::from_rgb(196, 20, 20), error);
