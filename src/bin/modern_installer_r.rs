@@ -233,7 +233,7 @@ impl eframe::App for InstallerApp {
                             if let Some(error) = validation_error.as_ref() {
                                 ui.colored_label(Color32::from_rgb(196, 20, 20), error);
                             }
-                            ui.horizontal_centered(|ui| {
+                            ui.horizontal(|ui| {
                                 if let Some(old_version) = self.existing.installed_version.as_ref()
                                 {
                                     ui.label(old_version.to_string());
@@ -296,7 +296,7 @@ impl eframe::App for InstallerApp {
                         }
 
                         if let Some(error) = self.error_text.as_ref() {
-                            ui.add_space(8.0);
+
                             ui.colored_label(Color32::from_rgb(196, 20, 20), error);
                         }
                     });
