@@ -18,12 +18,14 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::CommandExt;
 use sysinfo::{ProcessesToUpdate, Signal, System};
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA};
 #[cfg(windows)]
 use windows_sys::Win32::System::RestartManager::{
     CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources,
     RmStartSession,
 };
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, KEY_WRITE};
 use zip::ZipArchive;
@@ -41,6 +43,8 @@ const UNINSTALL_REGISTRY_ROOT: &str = "Software\\Microsoft\\Windows\\CurrentVers
 const ERROR_SHARING_VIOLATION: i32 = 32;
 #[cfg(windows)]
 const ERROR_LOCK_VIOLATION: i32 = 33;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const ACCESS_DELETE: u32 = 0x0001_0000;
 #[cfg(windows)]
@@ -60,6 +64,12 @@ pub struct ExistingInstall {
 pub struct InstallResult {
     pub installed_path: PathBuf,
     pub executable_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct LockingProcessInfo {
+    pub pid: u32,
+    pub name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +174,20 @@ pub fn find_locked_files_in_directory(directory: &Path) -> Result<Vec<PathBuf>> 
 pub fn find_locked_files_for_install(info: &InstallerInfo, install_path: &Path) -> Result<Vec<PathBuf>> {
     let target_dirs = collect_install_target_directories(info, install_path)?;
     find_locked_files_in_directories(&target_dirs)
+}
+
+pub fn find_lock_preview_for_install(
+    info: &InstallerInfo,
+    install_path: &Path,
+) -> Result<(Vec<PathBuf>, Vec<LockingProcessInfo>)> {
+    let target_dirs = collect_install_target_directories(info, install_path)?;
+    let locked_files = find_locked_files_in_directories(&target_dirs)?;
+    if locked_files.is_empty() {
+        return Ok((locked_files, Vec::new()));
+    }
+    let locking_pids = find_locking_process_ids(&locked_files).unwrap_or_default();
+    let locking_processes = collect_locking_process_infos(&target_dirs, &locking_pids);
+    Ok((locked_files, locking_processes))
 }
 
 pub fn run_install<F>(
@@ -885,72 +909,211 @@ fn find_locking_process_ids(locked_files: &[PathBuf]) -> Result<Vec<u32>> {
 fn find_locking_process_ids(_locked_files: &[PathBuf]) -> Result<Vec<u32>> {
     Ok(Vec::new())
 }
+
+fn collect_locking_process_infos(
+    target_directories: &[PathBuf],
+    locking_pids: &[u32],
+) -> Vec<LockingProcessInfo> {
+    let normalized_target_dirs = target_directories
+        .iter()
+        .map(|directory| normalize_path(directory))
+        .collect::<Vec<_>>();
+    let locking_pid_set = locking_pids.iter().copied().collect::<HashSet<u32>>();
+    let current_pid = std::process::id();
+
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+
+    let mut infos = Vec::new();
+    let mut seen_pids = HashSet::new();
+    for process in system.processes().values() {
+        let pid = process.pid().as_u32();
+        if pid == 0 || pid == current_pid {
+            continue;
+        }
+
+        let in_locking_pid_set = locking_pid_set.contains(&pid);
+        let in_target_directory = process.exe().is_some_and(|exe| {
+            let normalized_exe = normalize_path(exe);
+            normalized_target_dirs
+                .iter()
+                .any(|target_dir| path_in_directory(&normalized_exe, target_dir))
+        });
+        let should_include = if locking_pid_set.is_empty() {
+            in_target_directory
+        } else {
+            in_locking_pid_set || in_target_directory
+        };
+
+        if !should_include || !seen_pids.insert(pid) {
+            continue;
+        }
+
+        infos.push(LockingProcessInfo {
+            pid,
+            name: process.name().to_string_lossy().to_string(),
+        });
+    }
+
+    for pid in locking_pids {
+        if *pid == 0 || *pid == current_pid || !seen_pids.insert(*pid) {
+            continue;
+        }
+        infos.push(LockingProcessInfo {
+            pid: *pid,
+            name: "Unknown".to_string(),
+        });
+    }
+
+    infos.sort_by_key(|info| info.pid);
+    infos
+}
+
+#[cfg(windows)]
+fn kill_by_pid_fallback(pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+
+    let terminated = unsafe { TerminateProcess(handle, 1) != 0 };
+    unsafe {
+        CloseHandle(handle);
+    }
+    terminated
+}
+
+#[cfg(not(windows))]
+fn kill_by_pid_fallback(_pid: u32) -> bool {
+    false
+}
+
 fn terminate_processes_for_install_targets(info: &InstallerInfo, install_path: &Path) -> Result<()> {
     let target_directories = collect_install_target_directories(info, install_path)?;
     let normalized_target_dirs = target_directories
         .iter()
         .map(|directory| normalize_path(directory))
         .collect::<Vec<_>>();
+    let current_pid = std::process::id();
+    let mut locked_files = find_locked_files_in_directories(&target_directories)?;
+    if locked_files.is_empty() {
+        return Ok(());
+    }
 
-    for _ in 0..10 {
-        let locked_files = find_locked_files_in_directories(&target_directories)?;
-        if locked_files.is_empty() {
-            return Ok(());
-        }
-
+    for attempt in 0..10 {
         let locking_pids = find_locking_process_ids(&locked_files).unwrap_or_default();
-        let locking_pid_set = locking_pids.into_iter().collect::<HashSet<u32>>();
+        let locking_pid_set = locking_pids.iter().copied().collect::<HashSet<u32>>();
 
         let mut system = System::new_all();
         system.refresh_processes(ProcessesToUpdate::All, true);
 
         let mut matched_any = false;
+        let mut handled_locking_pids = HashSet::new();
+
         for process in system.processes().values() {
-            let should_kill = if !locking_pid_set.is_empty() {
-                locking_pid_set.contains(&process.pid().as_u32())
-            } else {
-                let Some(exe) = process.exe() else {
-                    continue;
-                };
+            let pid = process.pid().as_u32();
+            if pid == 0 || pid == current_pid {
+                continue;
+            }
+
+            let in_locking_pid_set = locking_pid_set.contains(&pid);
+            let in_target_directory = process.exe().is_some_and(|exe| {
                 let normalized_exe = normalize_path(exe);
                 normalized_target_dirs
                     .iter()
                     .any(|target_dir| path_in_directory(&normalized_exe, target_dir))
-            };
+            });
+            let should_kill = in_locking_pid_set || in_target_directory;
 
             if !should_kill {
                 continue;
             }
 
+            if in_locking_pid_set {
+                handled_locking_pids.insert(pid);
+            }
             matched_any = true;
-            if process.kill_with(Signal::Kill).is_none() {
-                let _ = process.kill();
+            let killed = process
+                .kill_with(Signal::Kill)
+                .or_else(|| Some(process.kill()))
+                .unwrap_or(false);
+            if !killed {
+                let _ = kill_by_pid_fallback(pid);
             }
         }
 
-        if !matched_any {
-            thread::sleep(Duration::from_secs(1));
-            continue;
+        for pid in locking_pid_set {
+            if pid == 0 || pid == current_pid || handled_locking_pids.contains(&pid) {
+                continue;
+            }
+            matched_any = true;
+            let _ = kill_by_pid_fallback(pid);
         }
 
-        thread::sleep(Duration::from_secs(1));
+        if !matched_any {
+            thread::sleep(Duration::from_millis(800));
+        } else {
+            thread::sleep(Duration::from_millis(800));
+        }
+
+        locked_files = locked_files
+            .into_iter()
+            .filter(|path| path.is_file() && is_file_locked(path))
+            .collect();
+        if locked_files.is_empty() {
+            return Ok(());
+        }
+
+        // Avoid repeatedly crawling large target directories on every retry.
+        // Re-scan periodically to catch newly-created or newly-locked files.
+        if attempt % 3 == 2 {
+            locked_files = find_locked_files_in_directories(&target_directories)?;
+            if locked_files.is_empty() {
+                return Ok(());
+            }
+        }
     }
 
     let remaining_locked_files = find_locked_files_in_directories(&target_directories)?;
+    let locking_pids = find_locking_process_ids(&remaining_locked_files).unwrap_or_default();
     let example_files = remaining_locked_files
         .iter()
         .take(3)
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let process_summary = if locking_pids.is_empty() {
+        String::new()
+    } else {
+        let mut system = System::new_all();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let names = locking_pids
+            .into_iter()
+            .take(6)
+            .map(|pid| {
+                system
+                    .processes()
+                    .values()
+                    .find(|process| process.pid().as_u32() == pid)
+                    .map(|process| format!("{}({pid})", process.name().to_string_lossy()))
+                    .unwrap_or_else(|| format!("pid {pid}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("; locking processes: {names}")
+    };
     bail!(
-        "failed to terminate processes locking install target files: {} file(s) still locked{}",
+        "failed to terminate processes locking install target files: {} file(s) still locked{}{}",
         remaining_locked_files.len(),
         if example_files.is_empty() {
             String::new()
         } else {
             format!(" (e.g. {example_files})")
-        }
+        },
+        process_summary
     );
 }
 
@@ -969,12 +1132,17 @@ fn path_in_directory(path: &str, directory: &str) -> bool {
 
 fn terminate_processes_by_path(executable_path: &Path) -> Result<()> {
     let target = normalize_path(executable_path);
+    let current_pid = std::process::id();
     for _ in 0..10 {
         let mut system = System::new_all();
         system.refresh_processes(ProcessesToUpdate::All, true);
 
         let mut matched_any = false;
         for process in system.processes().values() {
+            let pid = process.pid().as_u32();
+            if pid == 0 || pid == current_pid {
+                continue;
+            }
             let Some(exe) = process.exe() else {
                 continue;
             };
@@ -982,8 +1150,12 @@ fn terminate_processes_by_path(executable_path: &Path) -> Result<()> {
                 continue;
             }
             matched_any = true;
-            if process.kill_with(Signal::Kill).is_none() {
-                let _ = process.kill();
+            let killed = process
+                .kill_with(Signal::Kill)
+                .or_else(|| Some(process.kill()))
+                .unwrap_or(false);
+            if !killed {
+                let _ = kill_by_pid_fallback(pid);
             }
         }
 
@@ -1080,7 +1252,7 @@ fn schedule_directory_cleanup(install_path: &Path) -> Result<()> {
     command.args(["/C", &cmd_script]);
     #[cfg(windows)]
     {
-        command.creation_flags(0x08000000);
+        command.creation_flags(CREATE_NO_WINDOW);
     }
     command.spawn()?;
     Ok(())

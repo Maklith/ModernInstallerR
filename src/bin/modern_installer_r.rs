@@ -1,15 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use eframe::egui::{self, Color32, RichText, ViewportBuilder, Widget};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 
-use modern_installer_r::installer_engine::{self, ExistingInstall, InstallResult};
+use modern_installer_r::installer_engine::{self, ExistingInstall, InstallResult, LockingProcessInfo};
 use modern_installer_r::model::InstallerInfo;
 use modern_installer_r::{resources, ui_fonts, util};
 
@@ -40,7 +44,8 @@ struct InstallerApp {
     logo_texture: Option<egui::TextureHandle>,
     show_lock_confirmation: bool,
     pending_install_path: Option<PathBuf>,
-    locked_files_preview: Vec<PathBuf>,
+    locked_file_count: usize,
+    locking_processes_preview: Vec<LockingProcessInfo>,
 }
 
 impl InstallerApp {
@@ -62,7 +67,8 @@ impl InstallerApp {
             logo_texture: None,
             show_lock_confirmation: false,
             pending_install_path: None,
-            locked_files_preview: Vec::new(),
+            locked_file_count: 0,
+            locking_processes_preview: Vec::new(),
         }
     }
 
@@ -106,7 +112,8 @@ impl InstallerApp {
     fn start_install(&mut self, install_path: PathBuf) {
         self.show_lock_confirmation = false;
         self.pending_install_path = None;
-        self.locked_files_preview.clear();
+        self.locked_file_count = 0;
+        self.locking_processes_preview.clear();
 
         self.error_text = None;
         self.progress = 0;
@@ -141,8 +148,11 @@ impl InstallerApp {
             return;
         }
 
-        let locked_files = match installer_engine::find_locked_files_for_install(&self.info, &install_path) {
-            Ok(files) => files,
+        let (locked_files, locking_processes) = match installer_engine::find_lock_preview_for_install(
+            &self.info,
+            &install_path,
+        ) {
+            Ok(result) => result,
             Err(error) => {
                 self.error_text = Some(error.to_string());
                 return;
@@ -155,7 +165,8 @@ impl InstallerApp {
         }
 
         self.pending_install_path = Some(install_path);
-        self.locked_files_preview = locked_files;
+        self.locked_file_count = locked_files.len();
+        self.locking_processes_preview = locking_processes;
         self.show_lock_confirmation = true;
         self.error_text = None;
     }
@@ -163,7 +174,8 @@ impl InstallerApp {
     fn cancel_pending_install(&mut self) {
         self.show_lock_confirmation = false;
         self.pending_install_path = None;
-        self.locked_files_preview.clear();
+        self.locked_file_count = 0;
+        self.locking_processes_preview.clear();
         self.error_text = Some("安装已取消".to_string());
     }
     fn poll_worker(&mut self) {
@@ -414,7 +426,7 @@ impl eframe::App for InstallerApp {
                 .show(ctx, |ui| {
                     ui.label(format!(
                         "检测到本次安装涉及目录中有 {} 个文件被占用。",
-                        self.locked_files_preview.len()
+                        self.locked_file_count
                     ));
                     ui.label("继续安装将尝试结束相关进程。");
                     ui.add_space(8.0);
@@ -422,8 +434,8 @@ impl eframe::App for InstallerApp {
                     egui::ScrollArea::vertical()
                         .max_height(220.0)
                         .show(ui, |ui| {
-                            for path in &self.locked_files_preview {
-                                ui.label(path.display().to_string());
+                            for process in &self.locking_processes_preview {
+                                ui.label(format!("{} (PID {})", process.name, process.pid));
                             }
                         });
 
@@ -464,6 +476,49 @@ impl eframe::App for InstallerApp {
     }
 }
 
+fn installer_log_path() -> PathBuf {
+    env::temp_dir()
+        .join("ModernInstaller")
+        .join("ModernInstaller.log")
+}
+
+fn append_installer_log(message: &str) {
+    let log_path = installer_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) else {
+        return;
+    };
+    let _ = writeln!(file, "{:?} {message}", std::time::SystemTime::now());
+}
+
+fn report_startup_failure(context: &str, error: &str, show_dialog: bool) {
+    append_installer_log(&format!("{context}: {error}"));
+    if !show_dialog {
+        return;
+    }
+
+    let log_path = installer_log_path();
+    let description = format!("{context}\n{error}\n\n日志文件:\n{}", log_path.display());
+    let _ = MessageDialog::new()
+        .set_level(MessageLevel::Error)
+        .set_title("ModernInstaller")
+        .set_description(&description)
+        .set_buttons(MessageButtons::Ok)
+        .show();
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
+}
+
 fn run_silent_install() -> Result<()> {
     let info = resources::installer_info()?;
     let existing = installer_engine::read_existing_install(&info);
@@ -474,33 +529,86 @@ fn run_silent_install() -> Result<()> {
     Ok(())
 }
 
-fn main() -> eframe::Result {
-    if env::args().any(|arg| arg == "--silent") {
-        if let Err(error) = run_silent_install() {
-            eprintln!("{error}");
-            std::process::exit(1);
+fn run_gui_install() -> Result<()> {
+    append_installer_log("starting GUI installer");
+
+    let info = resources::installer_info().context("failed to load installer info")?;
+    let mut renderer_errors = Vec::new();
+
+    for renderer in [eframe::Renderer::Wgpu, eframe::Renderer::Glow] {
+        append_installer_log(&format!("trying renderer: {renderer:?}"));
+        let installer_icon =
+            resources::installer_icon_data().context("failed to load installer icon")?;
+        let app = InstallerApp::new(info.clone());
+        let native_options = eframe::NativeOptions {
+            viewport: ViewportBuilder::default()
+                .with_title("ModernInstaller")
+                .with_inner_size([600.0, 370.0])
+                .with_resizable(false)
+                .with_icon(installer_icon),
+            centered: true,
+            renderer,
+            ..Default::default()
+        };
+
+        match eframe::run_native(
+            "ModernInstaller",
+            native_options,
+            Box::new(move |cc| {
+                ui_fonts::apply_harmony_font(&cc.egui_ctx);
+                Ok(Box::new(app))
+            }),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let text = format!("{renderer:?}: {error}");
+                append_installer_log(&format!("renderer startup failed: {text}"));
+                renderer_errors.push(text);
+            }
         }
-        return Ok(());
     }
 
-    let info = resources::installer_info().expect("failed to load installer info");
-    let installer_icon = resources::installer_icon_data().expect("failed to load installer icon");
-    let app = InstallerApp::new(info);
-    let native_options = eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_title("ModernInstaller")
-            .with_inner_size([600.0, 370.0])
-            .with_resizable(false)
-            .with_icon(installer_icon),
-        centered: true,
-        ..Default::default()
-    };
-    eframe::run_native(
-        "ModernInstaller",
-        native_options,
-        Box::new(move |cc| {
-            ui_fonts::apply_harmony_font(&cc.egui_ctx);
-            Ok(Box::new(app))
-        }),
-    )
+    Err(anyhow!(
+        "failed to create installer window: {}",
+        renderer_errors.join(" | ")
+    ))
+}
+
+fn main() {
+    panic::set_hook(Box::new(|panic_info| {
+        append_installer_log(&format!("panic: {panic_info}"));
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        append_installer_log(&format!("backtrace:\n{backtrace}"));
+    }));
+
+    if env::args().any(|arg| arg == "--silent") {
+        match panic::catch_unwind(AssertUnwindSafe(run_silent_install)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                report_startup_failure("silent install failed", &error.to_string(), false);
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            Err(payload) => {
+                let panic_message = panic_payload_to_string(payload);
+                report_startup_failure("silent install panicked", &panic_message, false);
+                eprintln!("{panic_message}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    match panic::catch_unwind(AssertUnwindSafe(run_gui_install)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            report_startup_failure("installer startup failed", &error.to_string(), true);
+            std::process::exit(1);
+        }
+        Err(payload) => {
+            let panic_message = panic_payload_to_string(payload);
+            report_startup_failure("installer startup panicked", &panic_message, true);
+            std::process::exit(1);
+        }
+    }
 }
