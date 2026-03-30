@@ -6,9 +6,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use eframe::egui::{self, Color32, RichText, ViewportBuilder, Widget};
-use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 use modern_installer_r::installer_engine::{self, ExistingInstall, InstallResult};
 use modern_installer_r::model::InstallerInfo;
@@ -39,6 +38,9 @@ struct InstallerApp {
     worker_rx: Option<Receiver<InstallWorkerEvent>>,
     result: Option<InstallResult>,
     logo_texture: Option<egui::TextureHandle>,
+    show_lock_confirmation: bool,
+    pending_install_path: Option<PathBuf>,
+    locked_files_preview: Vec<PathBuf>,
 }
 
 impl InstallerApp {
@@ -58,6 +60,9 @@ impl InstallerApp {
             worker_rx: None,
             result: None,
             logo_texture: None,
+            show_lock_confirmation: false,
+            pending_install_path: None,
+            locked_files_preview: Vec::new(),
         }
     }
 
@@ -98,62 +103,10 @@ impl InstallerApp {
             &self.existing,
         )
     }
-
-    fn confirm_termination_for_locked_files(&mut self, install_path: &PathBuf) -> Result<bool> {
-        let locked_files = installer_engine::find_locked_files_for_install(&self.info, install_path)
-            .with_context(|| format!("failed to inspect locked files in {}", install_path.display()))?;
-        if locked_files.is_empty() {
-            return Ok(true);
-        }
-
-        const PREVIEW_LIMIT: usize = 8;
-        let preview = locked_files
-            .iter()
-            .take(PREVIEW_LIMIT)
-            .map(|path| format!("- {}", path.display()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let hidden_count = locked_files.len().saturating_sub(PREVIEW_LIMIT);
-
-        let mut message = format!(
-            "检测到本次安装涉及的目录中有 {} 个文件被占用。\n继续安装将尝试结束相关进程。\n\n{}",
-            locked_files.len(),
-            preview
-        );
-        if hidden_count > 0 {
-            message.push_str(&format!("\n... 另外还有 {hidden_count} 个文件"));
-        }
-        message.push_str("\n\n是否继续安装？");
-
-        let result = MessageDialog::new()
-            .set_level(MessageLevel::Warning)
-            .set_title("检测到文件占用")
-            .set_description(&message)
-            .set_buttons(MessageButtons::YesNo)
-            .show();
-        Ok(matches!(
-            result,
-            MessageDialogResult::Yes | MessageDialogResult::Ok
-        ))
-    }
-
-    fn start_install(&mut self) {
-        let install_path = PathBuf::from(self.install_path.trim());
-        if let Err(error) = self.validate_current() {
-            self.error_text = Some(error.to_string());
-            return;
-        }
-        match self.confirm_termination_for_locked_files(&install_path) {
-            Ok(true) => {}
-            Ok(false) => {
-                self.error_text = Some("安装已取消".to_string());
-                return;
-            }
-            Err(error) => {
-                self.error_text = Some(error.to_string());
-                return;
-            }
-        }
+    fn start_install(&mut self, install_path: PathBuf) {
+        self.show_lock_confirmation = false;
+        self.pending_install_path = None;
+        self.locked_files_preview.clear();
 
         self.error_text = None;
         self.progress = 0;
@@ -177,6 +130,42 @@ impl InstallerApp {
         });
     }
 
+    fn request_start_install(&mut self) {
+        if self.show_lock_confirmation {
+            return;
+        }
+
+        let install_path = PathBuf::from(self.install_path.trim());
+        if let Err(error) = self.validate_current() {
+            self.error_text = Some(error.to_string());
+            return;
+        }
+
+        let locked_files = match installer_engine::find_locked_files_for_install(&self.info, &install_path) {
+            Ok(files) => files,
+            Err(error) => {
+                self.error_text = Some(error.to_string());
+                return;
+            }
+        };
+
+        if locked_files.is_empty() {
+            self.start_install(install_path);
+            return;
+        }
+
+        self.pending_install_path = Some(install_path);
+        self.locked_files_preview = locked_files;
+        self.show_lock_confirmation = true;
+        self.error_text = None;
+    }
+
+    fn cancel_pending_install(&mut self) {
+        self.show_lock_confirmation = false;
+        self.pending_install_path = None;
+        self.locked_files_preview.clear();
+        self.error_text = Some("安装已取消".to_string());
+    }
     fn poll_worker(&mut self) {
         let mut clear_receiver = false;
         if let Some(receiver) = self.worker_rx.as_ref() {
@@ -278,7 +267,7 @@ impl eframe::App for InstallerApp {
                                 )
                                 .clicked()
                             {
-                                self.start_install();
+                                self.request_start_install();
                             }
                             if let Some(error) = validation_error.as_ref() {
                                 ui.colored_label(Color32::from_rgb(196, 20, 20), error);
@@ -339,7 +328,7 @@ impl eframe::App for InstallerApp {
                                     )
                                     .clicked()
                                 {
-                                    self.start_install();
+                                    self.request_start_install();
                                 }
                             });
 
@@ -409,6 +398,54 @@ impl eframe::App for InstallerApp {
                         }
                     });
                 });
+            }
+        }
+
+        if self.show_lock_confirmation {
+            let mut open = self.show_lock_confirmation;
+            let mut confirm_install = false;
+            let mut cancel_install = false;
+
+            egui::Window::new("检测到文件占用")
+                .collapsible(false)
+                .resizable(true)
+                .default_size([560.0, 360.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "检测到本次安装涉及目录中有 {} 个文件被占用。",
+                        self.locked_files_preview.len()
+                    ));
+                    ui.label("继续安装将尝试结束相关进程。");
+                    ui.add_space(8.0);
+
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for path in &self.locked_files_preview {
+                                ui.label(path.display().to_string());
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消安装").clicked() {
+                            cancel_install = true;
+                        }
+                        if ui.button("继续安装").clicked() {
+                            confirm_install = true;
+                        }
+                    });
+                });
+
+            if confirm_install {
+                if let Some(path) = self.pending_install_path.take() {
+                    self.start_install(path);
+                } else {
+                    self.cancel_pending_install();
+                }
+            } else if cancel_install || !open {
+                self.cancel_pending_install();
             }
         }
 
