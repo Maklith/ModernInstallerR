@@ -389,16 +389,20 @@ fn download_file_with_powershell(url: &str, output_path: &Path) -> Result<()> {
     let script = format!(
         "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{escaped_url}' -OutFile '{escaped_output}'"
     );
-    let status = Command::new("powershell")
-        .args([
+    let mut command = Command::new("powershell");
+    command.args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
             &script,
-        ])
-        .status()?;
+        ]);
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let status = command.status()?;
     if status.success() {
         Ok(())
     } else {
@@ -1211,16 +1215,20 @@ fn create_shortcut_with_powershell(
          $s.Save()"
     );
 
-    let status = Command::new("powershell")
-        .args([
+    let mut command = Command::new("powershell");
+    command.args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
             &script,
-        ])
-        .status()?;
+        ]);
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let status = command.status()?;
     if status.success() {
         Ok(())
     } else {
