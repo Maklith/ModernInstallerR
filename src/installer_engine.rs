@@ -186,7 +186,10 @@ pub fn find_locked_files_in_directory(directory: &Path) -> Result<Vec<PathBuf>> 
     Ok(locked_files)
 }
 
-pub fn find_locked_files_for_install(info: &InstallerInfo, install_path: &Path) -> Result<Vec<PathBuf>> {
+pub fn find_locked_files_for_install(
+    info: &InstallerInfo,
+    install_path: &Path,
+) -> Result<Vec<PathBuf>> {
     let target_dirs = collect_install_target_directories(info, install_path)?;
     find_locked_files_in_directories(&target_dirs)
 }
@@ -205,20 +208,19 @@ pub fn find_lock_preview_for_install(
     Ok((locked_files, locking_processes))
 }
 
-pub fn run_install<F>(
+pub fn run_install<F, C>(
     info: &InstallerInfo,
     install_path: &Path,
     mut report_progress: F,
+    mut confirm_terminate: C,
 ) -> Result<InstallResult>
 where
     F: FnMut(ProgressState),
+    C: FnMut(&[LockingProcessInfo]) -> Result<bool>,
 {
     report_progress(ProgressState::new(8, "正在准备安装"));
-    report_progress(ProgressState::new(
-        20,
-        "正在检测并结束相关进程",
-    ));
-    terminate_processes_for_install_targets(info, install_path)
+    report_progress(ProgressState::new(20, "正在检测并结束相关进程"));
+    terminate_processes_for_install_targets(info, install_path, &mut confirm_terminate)
         .context("中止目标进程时出现错误,安装被中止")?;
 
     report_progress(ProgressState::new(28, "正在检查在线依赖"));
@@ -226,16 +228,12 @@ where
         .context("failed to install online dependencies, installation aborted")?;
 
     report_progress(ProgressState::new(60, "正在解压应用包"));
-    extract_configured_packages(info, install_path)
-        .context("解压程序时出现错误,安装被中止")?;
+    extract_configured_packages(info, install_path).context("解压程序时出现错误,安装被中止")?;
 
     report_progress(ProgressState::new(82, "正在写入安装支持文件"));
     write_install_support_files(install_path).context("创建卸载程序时出现错误,安装被中止")?;
 
-    report_progress(ProgressState::new(
-        92,
-        "正在写入注册表并创建快捷方式",
-    ));
+    report_progress(ProgressState::new(92, "正在写入注册表并创建快捷方式"));
     write_registry_values(info, install_path)
         .and_then(|_| {
             create_or_replace_shortcuts(
@@ -273,27 +271,30 @@ pub fn resolve_uninstall_target(info: &InstallerInfo) -> Result<UninstallTarget>
     })
 }
 
-pub fn run_uninstall<F>(target: &UninstallTarget, mut report_progress: F) -> Result<()>
+pub fn run_uninstall<F, C>(
+    target: &UninstallTarget,
+    mut report_progress: F,
+    mut confirm_terminate: C,
+) -> Result<()>
 where
     F: FnMut(ProgressState),
+    C: FnMut(&[LockingProcessInfo]) -> Result<bool>,
 {
     report_progress(ProgressState::new(10, "正在准备卸载"));
-    report_progress(ProgressState::new(
-        35,
-        "正在结束正在运行的应用进程",
-    ));
-    terminate_processes_by_path(&target.install_path.join(&target.main_file))
-        .context("中止目标进程时出现错误,卸载被中止")?;
+    report_progress(ProgressState::new(35, "正在结束正在运行的应用进程"));
+    terminate_processes_by_path(
+        &target.install_path.join(&target.main_file),
+        &mut confirm_terminate,
+    )
+    .context("中止目标进程时出现错误,卸载被中止")?;
 
     report_progress(ProgressState::new(70, "正在删除安装文件"));
     remove_install_directory(&target.install_path).context("文件删除时出现错误,卸载被中止")?;
 
-    report_progress(ProgressState::new(
-        90,
-        "正在清理注册表和快捷方式",
-    ));
+    report_progress(ProgressState::new(90, "正在清理注册表和快捷方式"));
     delete_registry_values(target.is_64).context("移除安装注册时出现问题,卸载被中止")?;
-    remove_shortcuts(&target.app_name).context("移除快捷方式时出现错误,卸载近乎完成,请手动删除快捷方式")?;
+    remove_shortcuts(&target.app_name)
+        .context("移除快捷方式时出现错误,卸载近乎完成,请手动删除快捷方式")?;
 
     report_progress(ProgressState::new(100, "卸载完成"));
     Ok(())
@@ -322,10 +323,7 @@ where
     F: FnMut(ProgressState),
 {
     if info.install_dependencies.is_empty() {
-        report_progress(ProgressState::new(
-            stage_end,
-            "未配置在线依赖，已跳过",
-        ));
+        report_progress(ProgressState::new(stage_end, "未配置在线依赖，已跳过"));
         return Ok(());
     }
 
@@ -344,23 +342,13 @@ where
 
         report_progress(ProgressState::new(
             progress_within_stage(stage_start, stage_end, base_step, total_steps),
-            format!(
-                "依赖 {}/{}：正在检查 {}",
-                index + 1,
-                total,
-                dep_name
-            ),
+            format!("依赖 {}/{}：正在检查 {}", index + 1, total, dep_name),
         ));
 
         if should_skip_dependency_install(dependency, info, install_path)? {
             report_progress(ProgressState::new(
                 progress_within_stage(stage_start, stage_end, base_step + 3, total_steps),
-                format!(
-                    "依赖 {}/{}：{} 已安装，已跳过",
-                    index + 1,
-                    total,
-                    dep_name
-                ),
+                format!("依赖 {}/{}：{} 已安装，已跳过", index + 1, total, dep_name),
             ));
             continue;
         }
@@ -370,36 +358,21 @@ where
 
         report_progress(ProgressState::new(
             progress_within_stage(stage_start, stage_end, base_step + 1, total_steps),
-            format!(
-                "依赖 {}/{}：正在下载 {}",
-                index + 1,
-                total,
-                dep_name
-            ),
+            format!("依赖 {}/{}：正在下载 {}", index + 1, total, dep_name),
         ));
         download_file_with_powershell(&dependency.url, &download_path)
             .with_context(|| format!("failed to download dependency {}", dependency.name))?;
 
         report_progress(ProgressState::new(
             progress_within_stage(stage_start, stage_end, base_step + 2, total_steps),
-            format!(
-                "依赖 {}/{}：正在安装 {}",
-                index + 1,
-                total,
-                dep_name
-            ),
+            format!("依赖 {}/{}：正在安装 {}", index + 1, total, dep_name),
         ));
         run_dependency_installer(dependency, &download_path)
             .with_context(|| format!("failed to install dependency {}", dependency.name))?;
 
         report_progress(ProgressState::new(
             progress_within_stage(stage_start, stage_end, base_step + 3, total_steps),
-            format!(
-                "依赖 {}/{}：{} 安装完成",
-                index + 1,
-                total,
-                dep_name
-            ),
+            format!("依赖 {}/{}：{} 安装完成", index + 1, total, dep_name),
         ));
     }
 
@@ -501,13 +474,13 @@ fn download_file_with_powershell(url: &str, output_path: &Path) -> Result<()> {
     );
     let mut command = Command::new("powershell");
     command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ]);
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &script,
+    ]);
     #[cfg(windows)]
     {
         command.creation_flags(CREATE_NO_WINDOW);
@@ -520,7 +493,10 @@ fn download_file_with_powershell(url: &str, output_path: &Path) -> Result<()> {
     }
 }
 
-fn run_dependency_installer(dependency: &InstallDependencyRule, installer_path: &Path) -> Result<()> {
+fn run_dependency_installer(
+    dependency: &InstallDependencyRule,
+    installer_path: &Path,
+) -> Result<()> {
     let extension = installer_path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -860,7 +836,10 @@ fn find_locked_files_in_directories(directories: &[PathBuf]) -> Result<Vec<PathB
     Ok(locked_files)
 }
 
-fn collect_install_target_directories(info: &InstallerInfo, install_path: &Path) -> Result<Vec<PathBuf>> {
+fn collect_install_target_directories(
+    info: &InstallerInfo,
+    install_path: &Path,
+) -> Result<Vec<PathBuf>> {
     let mut directories = Vec::new();
     let mut seen_directories = HashSet::new();
 
@@ -888,7 +867,10 @@ fn collect_install_target_directories(info: &InstallerInfo, install_path: &Path)
     Ok(directories)
 }
 
-fn collect_locked_files_recursively(directory: &Path, locked_files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_locked_files_recursively(
+    directory: &Path,
+    locked_files: &mut Vec<PathBuf>,
+) -> Result<()> {
     let entries = fs::read_dir(directory)
         .with_context(|| format!("failed to read directory {}", directory.display()))?;
     for entry in entries {
@@ -952,7 +934,10 @@ fn find_locking_process_ids(locked_files: &[PathBuf]) -> Result<Vec<u32>> {
                     .collect::<Vec<u16>>()
             })
             .collect::<Vec<_>>();
-        let path_ptrs = wide_paths.iter().map(|path| path.as_ptr()).collect::<Vec<_>>();
+        let path_ptrs = wide_paths
+            .iter()
+            .map(|path| path.as_ptr())
+            .collect::<Vec<_>>();
 
         let register_status = unsafe {
             RmRegisterResources(
@@ -989,7 +974,8 @@ fn find_locking_process_ids(locked_files: &[PathBuf]) -> Result<Vec<u32>> {
             bail!("RmGetList failed with code {first_get_status}");
         }
 
-        let mut process_infos = vec![unsafe { std::mem::zeroed::<RM_PROCESS_INFO>() }; process_info_needed as usize];
+        let mut process_infos =
+            vec![unsafe { std::mem::zeroed::<RM_PROCESS_INFO>() }; process_info_needed as usize];
         process_info_count = process_info_needed;
         let second_get_status = unsafe {
             RmGetList(
@@ -1083,6 +1069,40 @@ fn collect_locking_process_infos(
     infos
 }
 
+fn collect_processes_by_executable_path(executable_path: &Path) -> Vec<LockingProcessInfo> {
+    let target = normalize_path(executable_path);
+    if target.is_empty() {
+        return Vec::new();
+    }
+
+    let current_pid = std::process::id();
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+
+    let mut infos = Vec::new();
+    let mut seen_pids = HashSet::new();
+    for process in system.processes().values() {
+        let pid = process.pid().as_u32();
+        if pid == 0 || pid == current_pid || !seen_pids.insert(pid) {
+            continue;
+        }
+        let Some(exe) = process.exe() else {
+            continue;
+        };
+        if normalize_path(exe) != target {
+            continue;
+        }
+
+        infos.push(LockingProcessInfo {
+            pid,
+            name: process.name().to_string_lossy().to_string(),
+        });
+    }
+
+    infos.sort_by_key(|info| info.pid);
+    infos
+}
+
 #[cfg(windows)]
 fn kill_by_pid_fallback(pid: u32) -> bool {
     if pid == 0 || pid == std::process::id() {
@@ -1105,7 +1125,14 @@ fn kill_by_pid_fallback(_pid: u32) -> bool {
     false
 }
 
-fn terminate_processes_for_install_targets(info: &InstallerInfo, install_path: &Path) -> Result<()> {
+fn terminate_processes_for_install_targets<C>(
+    info: &InstallerInfo,
+    install_path: &Path,
+    confirm_terminate: &mut C,
+) -> Result<()>
+where
+    C: FnMut(&[LockingProcessInfo]) -> Result<bool>,
+{
     let target_directories = collect_install_target_directories(info, install_path)?;
     let normalized_target_dirs = target_directories
         .iter()
@@ -1115,6 +1142,15 @@ fn terminate_processes_for_install_targets(info: &InstallerInfo, install_path: &
     let mut locked_files = find_locked_files_in_directories(&target_directories)?;
     if locked_files.is_empty() {
         return Ok(());
+    }
+
+    let initial_locking_pids = find_locking_process_ids(&locked_files).unwrap_or_default();
+    let processes_to_terminate =
+        collect_locking_process_infos(&target_directories, &initial_locking_pids);
+    if !processes_to_terminate.is_empty()
+        && !confirm_terminate(&processes_to_terminate).context("安装时确认终止进程失败")?
+    {
+        bail!("安装已取消");
     }
 
     for attempt in 0..10 {
@@ -1244,7 +1280,17 @@ fn path_in_directory(path: &str, directory: &str) -> bool {
         || rest.starts_with('/')
 }
 
-fn terminate_processes_by_path(executable_path: &Path) -> Result<()> {
+fn terminate_processes_by_path<C>(executable_path: &Path, confirm_terminate: &mut C) -> Result<()>
+where
+    C: FnMut(&[LockingProcessInfo]) -> Result<bool>,
+{
+    let processes_to_terminate = collect_processes_by_executable_path(executable_path);
+    if !processes_to_terminate.is_empty()
+        && !confirm_terminate(&processes_to_terminate).context("卸载时确认终止进程失败")?
+    {
+        bail!("卸载已取消");
+    }
+
     let target = normalize_path(executable_path);
     let current_pid = std::process::id();
     for _ in 0..10 {
@@ -1327,13 +1373,13 @@ fn create_shortcut_with_powershell(
 
     let mut command = Command::new("powershell");
     command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ]);
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &script,
+    ]);
     #[cfg(windows)]
     {
         command.creation_flags(CREATE_NO_WINDOW);

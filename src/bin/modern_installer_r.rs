@@ -1,4 +1,4 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use eframe::egui::{self, Color32, RichText, ViewportBuilder};
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
 
@@ -27,6 +27,11 @@ enum InstallPhase {
 
 enum InstallWorkerEvent {
     Progress(ProgressState),
+    RequestTerminateConfirmation {
+        action: String,
+        processes: Vec<LockingProcessInfo>,
+        response_tx: mpsc::Sender<bool>,
+    },
     Failed(String),
     Completed(InstallResult),
 }
@@ -45,10 +50,10 @@ struct InstallerApp {
     worker_rx: Option<Receiver<InstallWorkerEvent>>,
     result: Option<InstallResult>,
     logo_texture: Option<egui::TextureHandle>,
-    show_lock_confirmation: bool,
-    pending_install_path: Option<PathBuf>,
-    locked_file_count: usize,
-    locking_processes_preview: Vec<LockingProcessInfo>,
+    show_terminate_confirmation: bool,
+    terminate_confirmation_action: String,
+    terminate_confirmation_processes: Vec<LockingProcessInfo>,
+    terminate_confirmation_response_tx: Option<mpsc::Sender<bool>>,
 }
 
 impl InstallerApp {
@@ -69,10 +74,10 @@ impl InstallerApp {
             worker_rx: None,
             result: None,
             logo_texture: None,
-            show_lock_confirmation: false,
-            pending_install_path: None,
-            locked_file_count: 0,
-            locking_processes_preview: Vec::new(),
+            show_terminate_confirmation: false,
+            terminate_confirmation_action: String::new(),
+            terminate_confirmation_processes: Vec::new(),
+            terminate_confirmation_response_tx: None,
         }
     }
 
@@ -114,23 +119,31 @@ impl InstallerApp {
         )
     }
     fn start_install(&mut self, install_path: PathBuf) {
-        self.show_lock_confirmation = false;
-        self.pending_install_path = None;
-        self.locked_file_count = 0;
-        self.locking_processes_preview.clear();
-
         self.error_text = None;
         self.progress = 0;
         self.progress_detail = "正在准备安装".to_string();
         self.phase = InstallPhase::Installing;
+        self.show_terminate_confirmation = false;
+        self.terminate_confirmation_action.clear();
+        self.terminate_confirmation_processes.clear();
+        self.terminate_confirmation_response_tx = None;
 
         let info = self.info.clone();
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
         thread::spawn(move || {
-            let result = installer_engine::run_install(&info, &install_path, |state| {
-                let _ = tx.send(InstallWorkerEvent::Progress(state));
-            });
+            let progress_tx = tx.clone();
+            let confirm_tx = tx.clone();
+            let result = installer_engine::run_install(
+                &info,
+                &install_path,
+                |state| {
+                    let _ = progress_tx.send(InstallWorkerEvent::Progress(state));
+                },
+                |processes| {
+                    request_process_termination_confirmation("安装", processes, &confirm_tx)
+                },
+            );
             match result {
                 Ok(done) => {
                     let _ = tx.send(InstallWorkerEvent::Completed(done));
@@ -143,46 +156,25 @@ impl InstallerApp {
     }
 
     fn request_start_install(&mut self) {
-        if self.show_lock_confirmation {
-            return;
-        }
-
         let install_path = PathBuf::from(self.install_path.trim());
         if let Err(error) = self.validate_current() {
             self.error_text = Some(error.to_string());
             return;
         }
 
-        let (locked_files, locking_processes) = match installer_engine::find_lock_preview_for_install(
-            &self.info,
-            &install_path,
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                self.error_text = Some(error.to_string());
-                return;
-            }
-        };
-
-        if locked_files.is_empty() {
-            self.start_install(install_path);
-            return;
-        }
-
-        self.pending_install_path = Some(install_path);
-        self.locked_file_count = locked_files.len();
-        self.locking_processes_preview = locking_processes;
-        self.show_lock_confirmation = true;
         self.error_text = None;
+        self.start_install(install_path);
     }
 
-    fn cancel_pending_install(&mut self) {
-        self.show_lock_confirmation = false;
-        self.pending_install_path = None;
-        self.locked_file_count = 0;
-        self.locking_processes_preview.clear();
-        self.error_text = Some("安装已取消".to_string());
+    fn finish_terminate_confirmation(&mut self, confirmed: bool) {
+        if let Some(response_tx) = self.terminate_confirmation_response_tx.take() {
+            let _ = response_tx.send(confirmed);
+        }
+        self.show_terminate_confirmation = false;
+        self.terminate_confirmation_action.clear();
+        self.terminate_confirmation_processes.clear();
     }
+
     fn poll_worker(&mut self) {
         let mut clear_receiver = false;
         if let Some(receiver) = self.worker_rx.as_ref() {
@@ -191,6 +183,19 @@ impl InstallerApp {
                     InstallWorkerEvent::Progress(state) => {
                         self.progress = state.percent;
                         self.progress_detail = state.detail;
+                    }
+                    InstallWorkerEvent::RequestTerminateConfirmation {
+                        action,
+                        processes,
+                        response_tx,
+                    } => {
+                        if let Some(prev_tx) = self.terminate_confirmation_response_tx.take() {
+                            let _ = prev_tx.send(false);
+                        }
+                        self.show_terminate_confirmation = true;
+                        self.terminate_confirmation_action = action;
+                        self.terminate_confirmation_processes = processes;
+                        self.terminate_confirmation_response_tx = Some(response_tx);
                     }
                     InstallWorkerEvent::Failed(message) => {
                         self.phase = InstallPhase::BeforeInstall;
@@ -239,7 +244,7 @@ impl eframe::App for InstallerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_logo_texture(ctx);
         self.poll_worker();
-        if matches!(self.phase, InstallPhase::Installing) {
+        if matches!(self.phase, InstallPhase::Installing) || self.show_terminate_confirmation {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
@@ -261,10 +266,8 @@ impl eframe::App for InstallerApp {
                         });
                     });
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let validation_error = self
-                        .validate_current()
-                        .err()
-                        .map(|error| error.to_string());
+                    let validation_error =
+                        self.validate_current().err().map(|error| error.to_string());
 
                     let can_install = validation_error.is_none();
 
@@ -404,8 +407,7 @@ impl eframe::App for InstallerApp {
                             if ui
                                 .add_enabled(
                                     can_install,
-                                    egui::Button::new("安装")
-                                        .min_size(egui::vec2(150.0, 40.0)),
+                                    egui::Button::new("安装").min_size(egui::vec2(150.0, 40.0)),
                                 )
                                 .clicked()
                             {
@@ -459,20 +461,24 @@ impl eframe::App for InstallerApp {
 
                             // 3. 放置实际组件
                             ui.horizontal(|ui| {
-                                if ui.add_sized([150.0, 40.0], egui::Button::new("完成安装")).clicked() {
+                                if ui
+                                    .add_sized([150.0, 40.0], egui::Button::new("完成安装"))
+                                    .clicked()
+                                {
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
 
                                 // 按钮之间的间距由 ui.spacing().item_spacing 自动处理
 
-                                if ui.add_sized([150.0, 40.0], egui::Button::new("立即体验")).clicked() {
+                                if ui
+                                    .add_sized([150.0, 40.0], egui::Button::new("立即体验"))
+                                    .clicked()
+                                {
                                     self.launch_application();
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
                             });
                         });
-
-
 
                         if let Some(error) = self.error_text.as_ref() {
                             ui.add_space(8.0);
@@ -483,51 +489,45 @@ impl eframe::App for InstallerApp {
             }
         }
 
-        if self.show_lock_confirmation {
-            let mut open = self.show_lock_confirmation;
-            let mut confirm_install = false;
-            let mut cancel_install = false;
+        if self.show_terminate_confirmation {
+            let mut open = self.show_terminate_confirmation;
+            let mut confirm = false;
+            let mut cancel = false;
 
-            egui::Window::new("检测到文件占用")
+            egui::Window::new("确认终止进程")
                 .collapsible(false)
                 .resizable(true)
                 .default_size([560.0, 360.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.label(format!(
-                        "检测到本次安装涉及目录中有 {} 个文件被占用。",
-                        self.locked_file_count
+                        "继续{}前将终止以下进程：",
+                        self.terminate_confirmation_action
                     ));
-                    ui.label("继续安装将尝试结束相关进程。");
                     ui.add_space(8.0);
-
                     egui::ScrollArea::vertical()
                         .max_height(220.0)
                         .show(ui, |ui| {
-                            for process in &self.locking_processes_preview {
+                            for process in &self.terminate_confirmation_processes {
                                 ui.label(format!("{} (PID {})", process.name, process.pid));
                             }
                         });
-
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("取消安装").clicked() {
-                            cancel_install = true;
+                        if ui.button("取消").clicked() {
+                            cancel = true;
                         }
-                        if ui.button("继续安装").clicked() {
-                            confirm_install = true;
+                        if ui.button("继续").clicked() {
+                            confirm = true;
                         }
                     });
                 });
 
-            if confirm_install {
-                if let Some(path) = self.pending_install_path.take() {
-                    self.start_install(path);
-                } else {
-                    self.cancel_pending_install();
-                }
-            } else if cancel_install || !open {
-                self.cancel_pending_install();
+            if confirm {
+                self.finish_terminate_confirmation(true);
+            } else if cancel || !open {
+                self.finish_terminate_confirmation(false);
             }
         }
 
@@ -589,12 +589,32 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     "unknown panic payload".to_string()
 }
 
+fn request_process_termination_confirmation(
+    action: &str,
+    processes: &[LockingProcessInfo],
+    event_tx: &mpsc::Sender<InstallWorkerEvent>,
+) -> Result<bool> {
+    if processes.is_empty() {
+        return Ok(true);
+    }
+
+    let (response_tx, response_rx) = mpsc::channel();
+    event_tx
+        .send(InstallWorkerEvent::RequestTerminateConfirmation {
+            action: action.to_string(),
+            processes: processes.to_vec(),
+            response_tx,
+        })
+        .context("发送终止进程确认请求失败")?;
+    response_rx.recv().context("终止进程确认响应通道已关闭")
+}
+
 fn run_silent_install() -> Result<()> {
     let info = resources::installer_info()?;
     let existing = installer_engine::read_existing_install(&info);
     let install_path = installer_engine::suggested_install_path(&info, &existing);
     installer_engine::validate_install(&info, &install_path, true, &existing)?;
-    let result = installer_engine::run_install(&info, &install_path, |_| {})?;
+    let result = installer_engine::run_install(&info, &install_path, |_| {}, |_| Ok(true))?;
     installer_engine::launch_application(&result.executable_path, &result.installed_path)?;
     Ok(())
 }
