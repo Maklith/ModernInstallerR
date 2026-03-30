@@ -29,6 +29,9 @@ tar = "0.4"
 winreg = "0.56"
 zip = { version = "8.2", default-features = false, features = ["deflate"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_RestartManager"] }
+
 [build-dependencies]
 font-subset = "0.1.0"
 flate2 = "1.1"

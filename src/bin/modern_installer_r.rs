@@ -6,8 +6,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText, ViewportBuilder, Widget};
+use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 use modern_installer_r::installer_engine::{self, ExistingInstall, InstallResult};
 use modern_installer_r::model::InstallerInfo;
@@ -98,11 +99,60 @@ impl InstallerApp {
         )
     }
 
+    fn confirm_termination_for_locked_files(&mut self, install_path: &PathBuf) -> Result<bool> {
+        let locked_files = installer_engine::find_locked_files_for_install(&self.info, install_path)
+            .with_context(|| format!("failed to inspect locked files in {}", install_path.display()))?;
+        if locked_files.is_empty() {
+            return Ok(true);
+        }
+
+        const PREVIEW_LIMIT: usize = 8;
+        let preview = locked_files
+            .iter()
+            .take(PREVIEW_LIMIT)
+            .map(|path| format!("- {}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hidden_count = locked_files.len().saturating_sub(PREVIEW_LIMIT);
+
+        let mut message = format!(
+            "检测到本次安装涉及的目录中有 {} 个文件被占用。\n继续安装将尝试结束相关进程。\n\n{}",
+            locked_files.len(),
+            preview
+        );
+        if hidden_count > 0 {
+            message.push_str(&format!("\n... 另外还有 {hidden_count} 个文件"));
+        }
+        message.push_str("\n\n是否继续安装？");
+
+        let result = MessageDialog::new()
+            .set_level(MessageLevel::Warning)
+            .set_title("检测到文件占用")
+            .set_description(&message)
+            .set_buttons(MessageButtons::YesNo)
+            .show();
+        Ok(matches!(
+            result,
+            MessageDialogResult::Yes | MessageDialogResult::Ok
+        ))
+    }
+
     fn start_install(&mut self) {
         let install_path = PathBuf::from(self.install_path.trim());
         if let Err(error) = self.validate_current() {
             self.error_text = Some(error.to_string());
             return;
+        }
+        match self.confirm_termination_for_locked_files(&install_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.error_text = Some("安装已取消".to_string());
+                return;
+            }
+            Err(error) => {
+                self.error_text = Some(error.to_string());
+                return;
+            }
         }
 
         self.error_text = None;
