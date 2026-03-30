@@ -28,7 +28,7 @@ use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, KEY_WRITE};
 use zip::ZipArchive;
 
-use crate::model::InstallerInfo;
+use crate::model::{InstallDependencyRule, InstallerInfo};
 use crate::resources::{self, EmbeddedPackage};
 use crate::util::{
     default_install_dir_for_arch, escape_ps_single_quote, is_windows_64bit_os, normalize_path,
@@ -178,6 +178,10 @@ where
     terminate_processes_for_install_targets(info, install_path)
         .context("中止目标进程时出现错误,安装被中止")?;
 
+    report_progress(35);
+    install_online_dependencies(info, install_path)
+        .context("failed to install online dependencies, installation aborted")?;
+
     report_progress(50);
     extract_configured_packages(info, install_path)
         .context("解压程序时出现错误,安装被中止")?;
@@ -251,6 +255,165 @@ pub fn launch_application(executable_path: &Path, install_dir: &Path) -> Result<
 
 fn uninstall_entry_name() -> String {
     format!("{{{}}}_ModernInstaller", resources::application_uuid())
+}
+
+fn install_online_dependencies(info: &InstallerInfo, install_path: &Path) -> Result<()> {
+    if info.install_dependencies.is_empty() {
+        return Ok(());
+    }
+
+    let download_root = env::temp_dir().join("ModernInstaller").join("dependencies");
+    fs::create_dir_all(&download_root)?;
+
+    for dependency in &info.install_dependencies {
+        if should_skip_dependency_install(dependency, info, install_path)? {
+            continue;
+        }
+
+        let download_name = dependency_download_file_name(dependency)?;
+        let download_path = download_root.join(download_name);
+
+        download_file_with_powershell(&dependency.url, &download_path)
+            .with_context(|| format!("failed to download dependency {}", dependency.name))?;
+        run_dependency_installer(dependency, &download_path)
+            .with_context(|| format!("failed to install dependency {}", dependency.name))?;
+    }
+
+    Ok(())
+}
+
+fn should_skip_dependency_install(
+    dependency: &InstallDependencyRule,
+    info: &InstallerInfo,
+    install_path: &Path,
+) -> Result<bool> {
+    let check_path = dependency.skip_if_exists.trim();
+    if check_path.is_empty() {
+        return Ok(false);
+    }
+    let resolved_path = resolve_package_target(check_path, install_path, info)?;
+    if resolved_path.exists() {
+        return Ok(true);
+    }
+
+    if is_dotnet_runtime_installed(dependency)? {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn is_dotnet_runtime_installed(dependency: &InstallDependencyRule) -> Result<bool> {
+    let runtime_name = dependency.runtime_name.trim();
+    if runtime_name.is_empty() {
+        return Ok(false);
+    }
+    let runtime_version_prefix = dependency.runtime_version_prefix.trim();
+
+    let output = match Command::new("dotnet").arg("--list-runtimes").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Ok(false),
+    };
+
+    let listing = String::from_utf8_lossy(&output.stdout);
+    for line in listing.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(version) = parts.next() else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case(runtime_name) {
+            continue;
+        }
+        if runtime_version_prefix.is_empty() || version.starts_with(runtime_version_prefix) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn dependency_download_file_name(dependency: &InstallDependencyRule) -> Result<String> {
+    let configured_name = dependency.file_name.trim();
+    if !configured_name.is_empty() {
+        return Ok(configured_name.to_string());
+    }
+
+    let url_no_query = dependency.url.trim().split('?').next().unwrap_or("");
+    let inferred = url_no_query.rsplit('/').next().unwrap_or("").trim();
+    if inferred.is_empty() {
+        bail!(
+            "dependency {} missing FileName and Url has no file name",
+            dependency.name
+        );
+    }
+    Ok(inferred.to_string())
+}
+
+fn download_file_with_powershell(url: &str, output_path: &Path) -> Result<()> {
+    let url = url.trim();
+    if url.is_empty() {
+        bail!("dependency Url is empty");
+    }
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let escaped_url = escape_ps_single_quote(url);
+    let escaped_output = escape_ps_single_quote(&output_path.to_string_lossy());
+    let script = format!(
+        "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{escaped_url}' -OutFile '{escaped_output}'"
+    );
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("powershell download failed")
+    }
+}
+
+fn run_dependency_installer(dependency: &InstallDependencyRule, installer_path: &Path) -> Result<()> {
+    let extension = installer_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let mut command = if extension == "msi" {
+        let mut command = Command::new("msiexec");
+        command.arg("/i").arg(installer_path);
+        if dependency.install_args.is_empty() {
+            command.args(["/qn", "/norestart"]);
+        } else {
+            command.args(&dependency.install_args);
+        }
+        command
+    } else {
+        let mut command = Command::new(installer_path);
+        command.args(&dependency.install_args);
+        command
+    };
+
+    if let Some(parent) = installer_path.parent() {
+        command.current_dir(parent);
+    }
+
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("dependency installer exited with status {status}")
+    }
 }
 
 fn extract_configured_packages(info: &InstallerInfo, install_path: &Path) -> Result<()> {
@@ -335,6 +498,11 @@ fn resolve_package_target(
 
     replace_env_placeholder(&mut resolved, "{ProgramData}", "ProgramData")?;
     replace_env_placeholder(&mut resolved, "%ProgramData%", "ProgramData")?;
+
+    replace_env_placeholder(&mut resolved, "{ProgramFiles}", "ProgramFiles")?;
+    replace_env_placeholder(&mut resolved, "%ProgramFiles%", "ProgramFiles")?;
+    replace_env_placeholder(&mut resolved, "{ProgramFilesX86}", "ProgramFiles(x86)")?;
+    replace_env_placeholder(&mut resolved, "%ProgramFiles(x86)%", "ProgramFiles(x86)")?;
 
     replace_env_placeholder(&mut resolved, "{UserProfile}", "USERPROFILE")?;
     replace_env_placeholder(&mut resolved, "%USERPROFILE%", "USERPROFILE")?;

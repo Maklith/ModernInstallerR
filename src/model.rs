@@ -18,6 +18,8 @@ pub struct InstallerInfo {
     pub is_64: bool,
     #[serde(rename = "InstallPackages", alias = "Packages", default)]
     pub install_packages: Vec<InstallPackageRule>,
+    #[serde(rename = "InstallDependencies", alias = "Dependencies", default)]
+    pub install_dependencies: Vec<InstallDependencyRule>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -26,6 +28,28 @@ pub struct InstallPackageRule {
     pub package: String,
     #[serde(rename = "Target", alias = "InstallTo", alias = "Destination")]
     pub target: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct InstallDependencyRule {
+    #[serde(rename = "Name", alias = "Dependency", alias = "DisplayName")]
+    pub name: String,
+    #[serde(rename = "Url", alias = "DownloadUrl")]
+    pub url: String,
+    #[serde(rename = "InstallArgs", alias = "Args", default)]
+    pub install_args: Vec<String>,
+    #[serde(rename = "FileName", alias = "OutputFile", default)]
+    pub file_name: String,
+    #[serde(rename = "SkipIfExists", alias = "CheckPath", default)]
+    pub skip_if_exists: String,
+    #[serde(rename = "RuntimeName", alias = "DotnetRuntimeName", default)]
+    pub runtime_name: String,
+    #[serde(
+        rename = "RuntimeVersionPrefix",
+        alias = "DotnetRuntimeVersionPrefix",
+        default
+    )]
+    pub runtime_version_prefix: String,
 }
 
 impl InstallerInfo {
