@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -9,11 +9,13 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
-use eframe::egui::{self, Color32, RichText, ViewportBuilder, Widget};
+use anyhow::{anyhow, Context, Result};
+use eframe::egui::{self, Color32, RichText, ViewportBuilder};
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
 
-use modern_installer_r::installer_engine::{self, ExistingInstall, InstallResult, LockingProcessInfo};
+use modern_installer_r::installer_engine::{
+    self, ExistingInstall, InstallResult, LockingProcessInfo, ProgressState,
+};
 use modern_installer_r::model::InstallerInfo;
 use modern_installer_r::{resources, ui_fonts, util};
 
@@ -24,7 +26,7 @@ enum InstallPhase {
 }
 
 enum InstallWorkerEvent {
-    Progress(u8),
+    Progress(ProgressState),
     Failed(String),
     Completed(InstallResult),
 }
@@ -38,6 +40,7 @@ struct InstallerApp {
     show_agreement: bool,
     phase: InstallPhase,
     progress: u8,
+    progress_detail: String,
     error_text: Option<String>,
     worker_rx: Option<Receiver<InstallWorkerEvent>>,
     result: Option<InstallResult>,
@@ -61,6 +64,7 @@ impl InstallerApp {
             show_agreement: false,
             phase: InstallPhase::BeforeInstall,
             progress: 0,
+            progress_detail: "等待开始安装".to_string(),
             error_text: None,
             worker_rx: None,
             result: None,
@@ -117,14 +121,15 @@ impl InstallerApp {
 
         self.error_text = None;
         self.progress = 0;
+        self.progress_detail = "正在准备安装".to_string();
         self.phase = InstallPhase::Installing;
 
         let info = self.info.clone();
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
         thread::spawn(move || {
-            let result = installer_engine::run_install(&info, &install_path, |progress| {
-                let _ = tx.send(InstallWorkerEvent::Progress(progress));
+            let result = installer_engine::run_install(&info, &install_path, |state| {
+                let _ = tx.send(InstallWorkerEvent::Progress(state));
             });
             match result {
                 Ok(done) => {
@@ -183,8 +188,9 @@ impl InstallerApp {
         if let Some(receiver) = self.worker_rx.as_ref() {
             while let Ok(event) = receiver.try_recv() {
                 match event {
-                    InstallWorkerEvent::Progress(value) => {
-                        self.progress = value;
+                    InstallWorkerEvent::Progress(state) => {
+                        self.progress = state.percent;
+                        self.progress_detail = state.detail;
                     }
                     InstallWorkerEvent::Failed(message) => {
                         self.phase = InstallPhase::BeforeInstall;
@@ -193,6 +199,7 @@ impl InstallerApp {
                     }
                     InstallWorkerEvent::Completed(result) => {
                         self.progress = 100;
+                        self.progress_detail = "安装完成".to_string();
                         self.result = Some(result);
                         self.phase = InstallPhase::AfterInstall;
                         clear_receiver = true;
@@ -254,23 +261,104 @@ impl eframe::App for InstallerApp {
                         });
                     });
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let validation_error =
-                        self.validate_current().err().map(|error| error.to_string());
+                    let validation_error = self
+                        .validate_current()
+                        .err()
+                        .map(|error| error.to_string());
+
                     let can_install = validation_error.is_none();
+
                     ui.add_space(60.0);
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+
+                    // 整体纵向结构
+                    ui.vertical_centered(|ui| {
                         ui.spacing_mut().item_spacing.y = 5.0;
+
                         self.show_logo(ui, 96.0);
                         ui.add_space(10.0);
                         ui.label(RichText::new(&self.info.display_name).size(16.0));
                         ui.add_space(5.0);
+                    });
 
-                        if !self.show_detail {
+                    // 版本号：单独做一行水平居中
+                    {
+                        let old_text = self
+                            .existing
+                            .installed_version
+                            .as_ref()
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+
+                        let show_update = self.is_update();
+                        let new_text = self.info.display_version.clone();
+
+                        ui.horizontal(|ui| {
+                            let font_id = egui::TextStyle::Body.resolve(ui.style());
+                            let normal_color = ui.visuals().text_color();
+                            let accent_color = Color32::from_rgb(235, 132, 42);
+
+                            let old_width = if old_text.is_empty() {
+                                0.0
+                            } else {
+                                ui.painter()
+                                    .layout_no_wrap(old_text.clone(), font_id.clone(), normal_color)
+                                    .size()
+                                    .x
+                            };
+
+                            let arrow_width = if show_update {
+                                ui.painter()
+                                    .layout_no_wrap(">".to_owned(), font_id.clone(), accent_color)
+                                    .size()
+                                    .x
+                            } else {
+                                0.0
+                            };
+
+                            let new_width = if show_update {
+                                ui.painter()
+                                    .layout_no_wrap(new_text.clone(), font_id.clone(), accent_color)
+                                    .size()
+                                    .x
+                            } else {
+                                0.0
+                            };
+
+                            let spacing = ui.spacing().item_spacing.x;
+
+                            let total_width = if show_update {
+                                let mut w = 0.0;
+                                if !old_text.is_empty() {
+                                    w += old_width + spacing;
+                                }
+                                w += arrow_width + spacing + new_width;
+                                w
+                            } else {
+                                old_width
+                            };
+
+                            let gap = ((ui.available_width() - total_width) / 2.0).max(0.0);
+                            ui.add_space(gap);
+
+                            if !old_text.is_empty() {
+                                ui.label(old_text);
+                            }
+
+                            if show_update {
+                                ui.colored_label(accent_color, ">");
+                                ui.colored_label(accent_color, new_text);
+                            }
+                        });
+                    }
+
+                    if !self.show_detail {
+                        ui.vertical_centered(|ui| {
                             let button_label = if self.is_update() {
                                 "安装更新"
                             } else {
                                 "一键安装"
                             };
+
                             if ui
                                 .add_enabled(
                                     can_install,
@@ -281,76 +369,56 @@ impl eframe::App for InstallerApp {
                             {
                                 self.request_start_install();
                             }
+
                             if let Some(error) = validation_error.as_ref() {
                                 ui.colored_label(Color32::from_rgb(196, 20, 20), error);
                             }
-                            ui.horizontal(|ui| {
-                                if let Some(old_version) = self.existing.installed_version.as_ref()
-                                {
-                                    ui.label(old_version.to_string());
-                                } else {
-                                    ui.label("");
-                                }
-                                if self.is_update() {
-                                    ui.colored_label(Color32::from_rgb(235, 132, 42), ">");
-                                    ui.colored_label(
-                                        Color32::from_rgb(235, 132, 42),
-                                        &self.info.display_version,
-                                    );
-                                }
-                                ui.vertical_centered(|ui| {
-                                    let show_detail = egui::Button::new(
-                                        "更多安装选项",
-                                    );
-                                    if show_detail.ui(ui).clicked()
-                                    {
-                                        self.show_detail = true;
-                                    }
-                                });
 
-                            });
+                            if ui.button("更多安装选项").clicked() {
+                                self.show_detail = true;
+                            }
+                        });
+                    } else {
+                        // 安装路径：单独做一行水平居中
+                        ui.horizontal(|ui| {
+                            let content_width = 300.0 + ui.spacing().item_spacing.x + 44.0;
+                            let gap = ((ui.available_width() - content_width) / 2.0).max(0.0);
 
-                        } else {
-                            ui.horizontal(|ui| {
-                                // 1. 计算内容总宽度 (输入框 300 + 间距 + 按钮宽度约 44)
-                                let content_width = 300.0 + ui.spacing().item_spacing.x + 44.0;
+                            ui.add_space(gap);
 
-                                // 2. 计算左侧需要的空白间距
-                                let gap = (ui.available_width() - content_width) / 2.0;
+                            ui.add_sized(
+                                [300.0, 20.0],
+                                egui::TextEdit::singleline(&mut self.install_path),
+                            );
 
-                                if gap > 0.0 {
-                                    // 分配并占位，但不画任何东西
-                                    ui.allocate_space(egui::vec2(gap, 0.0));
-                                }
+                            if ui.button("修改").clicked() {
+                                self.pick_folder();
+                            }
+                        });
 
-                                // 3. 放置实际组件
-                                ui.add_sized([300.0, 20.0], egui::TextEdit::singleline(&mut self.install_path));
-                                if ui.button("修改").clicked() {
-                                    self.pick_folder();
-                                }
-                            });
-                            ui.vertical_centered(|ui| {
-                                if let Some(error) = validation_error.as_ref() {
-                                    ui.colored_label(Color32::from_rgb(196, 20, 20), error);
-                                }
-                                if ui
-                                    .add_enabled(
-                                        can_install,
-                                        egui::Button::new("安装").min_size(egui::vec2(150.0, 40.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.request_start_install();
-                                }
-                            });
+                        ui.vertical_centered(|ui| {
+                            if let Some(error) = validation_error.as_ref() {
+                                ui.colored_label(Color32::from_rgb(196, 20, 20), error);
+                            }
 
-                        }
+                            if ui
+                                .add_enabled(
+                                    can_install,
+                                    egui::Button::new("安装")
+                                        .min_size(egui::vec2(150.0, 40.0)),
+                                )
+                                .clicked()
+                            {
+                                self.request_start_install();
+                            }
+                        });
+                    }
 
-                        if let Some(error) = self.error_text.as_ref() {
-
+                    if let Some(error) = self.error_text.as_ref() {
+                        ui.vertical_centered(|ui| {
                             ui.colored_label(Color32::from_rgb(196, 20, 20), error);
-                        }
-                    });
+                        });
+                    }
                 });
             }
             InstallPhase::Installing => {
@@ -358,6 +426,8 @@ impl eframe::App for InstallerApp {
                     ui.vertical_centered(|ui| {
                         ui.add_space(130.0);
                         ui.heading("安装中..");
+                        ui.add_space(6.0);
+                        ui.label(&self.progress_detail);
                         ui.add_space(10.0);
                         ui.add(
                             egui::ProgressBar::new(self.progress as f32 / 100.0)

@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use eframe::egui::{self, Color32, RichText, ViewportBuilder};
 
-use modern_installer_r::installer_engine::{self, UninstallTarget};
+use modern_installer_r::installer_engine::{self, ProgressState, UninstallTarget};
 use modern_installer_r::{resources, ui_fonts};
 
 enum UninstallPhase {
@@ -18,7 +18,7 @@ enum UninstallPhase {
 }
 
 enum UninstallWorkerEvent {
-    Progress(u8),
+    Progress(ProgressState),
     Failed(String),
     Completed,
 }
@@ -27,7 +27,8 @@ struct UninstallerApp {
     app_name: String,
     target: Option<UninstallTarget>,
     phase: UninstallPhase,
-    remaining_progress: u8,
+    progress: u8,
+    progress_detail: String,
     error_text: Option<String>,
     worker_rx: Option<Receiver<UninstallWorkerEvent>>,
     logo_texture: Option<egui::TextureHandle>,
@@ -42,7 +43,8 @@ impl UninstallerApp {
                 app_name: target.app_name.clone(),
                 target: Some(target),
                 phase: UninstallPhase::BeforeUninstall,
-                remaining_progress: 100,
+                progress: 0,
+                progress_detail: "等待开始卸载".to_string(),
                 error_text: None,
                 worker_rx: None,
                 logo_texture: None,
@@ -51,7 +53,8 @@ impl UninstallerApp {
                 app_name: info.display_name,
                 target: None,
                 phase: UninstallPhase::BeforeUninstall,
-                remaining_progress: 100,
+                progress: 0,
+                progress_detail: "等待开始卸载".to_string(),
                 error_text: Some(error.to_string()),
                 worker_rx: None,
                 logo_texture: None,
@@ -90,14 +93,15 @@ impl UninstallerApp {
             return;
         };
         self.phase = UninstallPhase::Uninstalling;
-        self.remaining_progress = 100;
+        self.progress = 0;
+        self.progress_detail = "正在准备卸载".to_string();
         self.error_text = None;
 
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
         thread::spawn(move || {
-            let result = installer_engine::run_uninstall(&target, |remaining| {
-                let _ = tx.send(UninstallWorkerEvent::Progress(remaining));
+            let result = installer_engine::run_uninstall(&target, |state| {
+                let _ = tx.send(UninstallWorkerEvent::Progress(state));
             });
             match result {
                 Ok(()) => {
@@ -115,14 +119,18 @@ impl UninstallerApp {
         if let Some(receiver) = self.worker_rx.as_ref() {
             while let Ok(event) = receiver.try_recv() {
                 match event {
-                    UninstallWorkerEvent::Progress(value) => self.remaining_progress = value,
+                    UninstallWorkerEvent::Progress(state) => {
+                        self.progress = state.percent;
+                        self.progress_detail = state.detail;
+                    }
                     UninstallWorkerEvent::Failed(message) => {
                         self.phase = UninstallPhase::BeforeUninstall;
                         self.error_text = Some(message);
                         clear_receiver = true;
                     }
                     UninstallWorkerEvent::Completed => {
-                        self.remaining_progress = 0;
+                        self.progress = 100;
+                        self.progress_detail = "卸载完成".to_string();
                         self.phase = UninstallPhase::AfterUninstall;
                         clear_receiver = true;
                     }
@@ -173,8 +181,10 @@ impl eframe::App for UninstallerApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(130.0);
                     ui.heading("卸载中..");
+                    ui.add_space(6.0);
+                    ui.label(&self.progress_detail);
                     ui.add_space(10.0);
-                    let finished = 100 - self.remaining_progress;
+                    let finished = self.progress;
                     ui.add(
                         egui::ProgressBar::new(finished as f32 / 100.0)
                             .show_percentage()
