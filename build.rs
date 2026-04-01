@@ -6,14 +6,15 @@ use std::fs;
 use std::io;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use font_subset::Font;
 
 const SOURCE_FONT_REL: &str = "installer_assets/HarmonyOS_Sans_SC_Regular.ttf";
-const SOURCE_UNINSTALLER_REL: &str = "installer_assets/ModernInstaller.Uninstaller.exe";
 const PACKAGE_SOURCE_DIR_REL: &str = "installer_assets";
+const STANDALONE_UNINSTALLER_MANIFEST_REL: &str = "modern_uninstaller_r/Cargo.toml";
 const GENERATED_FONT_NAME: &str = "HarmonyOS_Sans_SC_Subset.ttf";
 const GENERATED_EMBEDDED_PACKAGES_RS_NAME: &str = "embedded_packages.rs";
 const GENERATED_UNINSTALLER_GZ_NAME: &str = "ModernInstaller.Uninstaller.exe.gz";
@@ -28,15 +29,18 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
 
     let source_font = manifest_dir.join(SOURCE_FONT_REL);
-    let source_uninstaller = manifest_dir.join(SOURCE_UNINSTALLER_REL);
     let package_source_dir = manifest_dir.join(PACKAGE_SOURCE_DIR_REL);
+    let standalone_uninstaller_manifest = manifest_dir.join(STANDALONE_UNINSTALLER_MANIFEST_REL);
     let generated_font = out_dir.join(GENERATED_FONT_NAME);
     let generated_embedded_packages_rs = out_dir.join(GENERATED_EMBEDDED_PACKAGES_RS_NAME);
     let generated_uninstaller_gz = out_dir.join(GENERATED_UNINSTALLER_GZ_NAME);
     let generated_text = out_dir.join(GENERATED_TEXT_NAME);
 
     println!("cargo:rerun-if-changed={}", source_font.display());
-    println!("cargo:rerun-if-changed={}", source_uninstaller.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        standalone_uninstaller_manifest.display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("installer_assets/info.json").display()
@@ -54,6 +58,7 @@ fn main() {
             .display()
     );
     print_rerun_for_dir(&manifest_dir.join("src"));
+    print_rerun_for_dir(&manifest_dir.join("modern_uninstaller_r/src"));
 
     if !source_font.exists() {
         panic!("source font not found: {}", source_font.display());
@@ -100,12 +105,73 @@ fn main() {
         );
     }
 
-    let uninstaller_stats = gzip_file(&source_uninstaller, &generated_uninstaller_gz)
+    let uninstaller_exe = build_standalone_uninstaller(&manifest_dir)
+        .expect("failed to build standalone uninstaller crate");
+    let uninstaller_stats = gzip_file(&uninstaller_exe, &generated_uninstaller_gz)
         .expect("failed to gzip embedded uninstaller payload");
     println!(
         "cargo:warning=embedded uninstaller compressed {} -> {} bytes",
         uninstaller_stats.source_len, uninstaller_stats.gz_len
     );
+}
+
+fn build_standalone_uninstaller(manifest_dir: &Path) -> io::Result<PathBuf> {
+    let target = env::var("TARGET").expect("missing TARGET");
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_owned());
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let uninstaller_manifest = manifest_dir.join(STANDALONE_UNINSTALLER_MANIFEST_REL);
+    if !uninstaller_manifest.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "standalone uninstaller manifest not found: {}",
+                uninstaller_manifest.display()
+            ),
+        ));
+    }
+
+    let uninstaller_target_dir = manifest_dir.join("target").join("standalone-uninstaller");
+    let mut command = Command::new(cargo);
+    command
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&uninstaller_manifest)
+        .arg("--target")
+        .arg(&target)
+        .arg("--target-dir")
+        .arg(&uninstaller_target_dir);
+    if profile == "release" {
+        command.arg("--release");
+    }
+    command.env_remove("CARGO_MAKEFLAGS");
+
+    let status = command.status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "failed to build standalone uninstaller crate, status: {status}"
+        )));
+    }
+
+    let executable_name = if target.contains("windows") {
+        "modern_uninstaller_r.exe"
+    } else {
+        "modern_uninstaller_r"
+    };
+    let executable = uninstaller_target_dir
+        .join(target)
+        .join(profile)
+        .join(executable_name);
+
+    if !executable.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "standalone uninstaller binary not found after build: {}",
+                executable.display()
+            ),
+        ));
+    }
+    Ok(executable)
 }
 
 fn print_rerun_for_dir(dir: &Path) {

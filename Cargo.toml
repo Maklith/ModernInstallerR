@@ -11,10 +11,6 @@ path = "src/lib.rs"
 name = "modern_installer_r"
 path = "src/bin/modern_installer_r.rs"
 
-[[bin]]
-name = "modern_uninstaller_r"
-path = "src/bin/modern_uninstaller_r.rs"
-
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

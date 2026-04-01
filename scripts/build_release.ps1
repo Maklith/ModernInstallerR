@@ -65,15 +65,23 @@ $profile = if ($Debug) { "debug" } else { "release" }
 Write-Host "Target architecture: $target"
 Write-Host "Build profile: $profile"
 
-$uninstallerArgs = @("build", "--target", $target, "--bin", "modern_uninstaller_r")
+$uninstallerManifest = Join-Path $root "modern_uninstaller_r\Cargo.toml"
+$uninstallerTargetDir = Join-Path $root "target\standalone-uninstaller"
+$uninstallerArgs = @(
+    "build",
+    "--manifest-path",
+    $uninstallerManifest,
+    "--target",
+    $target,
+    "--target-dir",
+    $uninstallerTargetDir
+)
 if (-not $Debug) { $uninstallerArgs += "--release" }
 & cargo @uninstallerArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$uninstallerExe = Join-Path $root "target\$target\$profile\modern_uninstaller_r.exe"
-$embeddedUninstaller = Join-Path $root "installer_assets\ModernInstaller.Uninstaller.exe"
-Copy-WithRetry -Source $uninstallerExe -Destination $embeddedUninstaller
-Write-Host "Updated embedded uninstaller: $embeddedUninstaller"
+$uninstallerExe = Join-Path $uninstallerTargetDir "$target\$profile\modern_uninstaller_r.exe"
+Write-Host "Built standalone uninstaller: $uninstallerExe"
 
 $installerArgs = @("build", "--target", $target, "--bin", "modern_installer_r")
 if (-not $Debug) { $installerArgs += "--release" }

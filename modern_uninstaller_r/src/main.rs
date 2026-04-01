@@ -11,10 +11,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText, ViewportBuilder};
 
-use modern_installer_r::installer_engine::{
-    self, LockingProcessInfo, ProgressState, UninstallTarget,
-};
-use modern_installer_r::{resources, ui_fonts};
+mod model;
+mod resources;
+mod ui_fonts;
+mod uninstall_engine;
+mod util;
+
+use crate::uninstall_engine::{self as installer_engine, LockingProcessInfo, ProgressState, UninstallTarget};
 
 enum UninstallPhase {
     BeforeUninstall,
