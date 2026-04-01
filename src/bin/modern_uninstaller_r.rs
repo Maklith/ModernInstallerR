@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    Arc,
+    mpsc::{self, Receiver},
+};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +42,8 @@ struct UninstallerApp {
     error_text: Option<String>,
     worker_rx: Option<Receiver<UninstallWorkerEvent>>,
     logo_texture: Option<egui::TextureHandle>,
+    window_icon: Option<Arc<egui::IconData>>,
+    window_icon_applied: bool,
     show_terminate_confirmation: bool,
     terminate_confirmation_action: String,
     terminate_confirmation_processes: Vec<LockingProcessInfo>,
@@ -48,6 +53,7 @@ struct UninstallerApp {
 impl UninstallerApp {
     fn new() -> Self {
         let info = resources::installer_info().expect("failed to read info.json");
+        let window_icon = resources::uninstaller_icon_data().ok().map(Arc::new);
         let resolved = installer_engine::resolve_uninstall_target(&info);
         match resolved {
             Ok(target) => Self {
@@ -59,6 +65,8 @@ impl UninstallerApp {
                 error_text: None,
                 worker_rx: None,
                 logo_texture: None,
+                window_icon: window_icon.clone(),
+                window_icon_applied: false,
                 show_terminate_confirmation: false,
                 terminate_confirmation_action: String::new(),
                 terminate_confirmation_processes: Vec::new(),
@@ -73,6 +81,8 @@ impl UninstallerApp {
                 error_text: Some(error.to_string()),
                 worker_rx: None,
                 logo_texture: None,
+                window_icon,
+                window_icon_applied: false,
                 show_terminate_confirmation: false,
                 terminate_confirmation_action: String::new(),
                 terminate_confirmation_processes: Vec::new(),
@@ -98,6 +108,17 @@ impl UninstallerApp {
             egui::TextureOptions::LINEAR,
         );
         self.logo_texture = Some(texture);
+    }
+
+    fn ensure_window_icon(&mut self, ctx: &egui::Context) {
+        if self.window_icon_applied {
+            return;
+        }
+        if let Some(icon) = self.window_icon.clone() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(icon)));
+        }
+        self.window_icon_applied = true;
+        ctx.request_repaint();
     }
 
     fn show_logo(&self, ui: &mut egui::Ui, size: f32) {
@@ -198,6 +219,7 @@ impl UninstallerApp {
 
 impl eframe::App for UninstallerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ensure_window_icon(ctx);
         self.ensure_logo_texture(ctx);
         self.poll_worker();
         if matches!(self.phase, UninstallPhase::Uninstalling) || self.show_terminate_confirmation {
