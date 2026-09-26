@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -56,6 +57,7 @@ pub struct UninstallTarget {
     pub install_path: PathBuf,
     pub is_64: bool,
     target_directories: Vec<PathBuf>,
+    uninstall_directories: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -72,13 +74,15 @@ pub fn resolve_uninstall_target(info: &InstallerInfo) -> Result<UninstallTarget>
     let app_name = existing
         .display_name
         .unwrap_or_else(|| info.display_name.clone());
-    let target_directories = collect_install_target_directories(info, &install_path)?;
+    let (target_directories, uninstall_directories) =
+        collect_uninstall_target_directories(info, &install_path)?;
 
     Ok(UninstallTarget {
         app_name,
         install_path,
         is_64: info.is_64,
         target_directories,
+        uninstall_directories,
     })
 }
 
@@ -95,6 +99,10 @@ where
     report_progress(ProgressState::new(35, "正在结束正在运行的应用进程"));
     terminate_processes_for_install_targets(&target.target_directories, &mut confirm_terminate)
         .context("failed while terminating target processes, uninstall aborted")?;
+
+    report_progress(ProgressState::new(60, "正在删除配置的卸载目录"));
+    remove_configured_directories(&target.uninstall_directories)
+        .context("failed while deleting configured directories, uninstall aborted")?;
 
     report_progress(ProgressState::new(70, "正在删除安装文件"));
     remove_install_directory(&target.install_path)
@@ -256,11 +264,12 @@ where
     )
 }
 
-fn collect_install_target_directories(
+fn collect_uninstall_target_directories(
     info: &InstallerInfo,
     install_path: &Path,
-) -> Result<Vec<PathBuf>> {
-    let mut directories = Vec::with_capacity(info.install_packages.len() + 1);
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut directories =
+        Vec::with_capacity(info.install_packages.len() + info.uninstall_directories.len() + 1);
     let mut seen_directories = HashSet::new();
     let install_dir = install_path.to_path_buf();
     seen_directories.insert(normalize_path(&install_dir));
@@ -273,7 +282,76 @@ fn collect_install_target_directories(
             directories.push(target_dir);
         }
     }
-    Ok(directories)
+
+    let mut uninstall_directories = Vec::with_capacity(info.uninstall_directories.len());
+    let mut seen_uninstall_directories = HashSet::new();
+    for rule in &info.uninstall_directories {
+        let target_dir = resolve_uninstall_directory(&rule.target, install_path, info)
+            .with_context(|| format!("invalid UninstallDirectories target: {}", rule.target))?;
+        let normalized = normalize_path(&target_dir);
+        if seen_directories.insert(normalized.clone()) {
+            directories.push(target_dir.clone());
+        }
+        if seen_uninstall_directories.insert(normalized) {
+            uninstall_directories.push(target_dir);
+        }
+    }
+    Ok((directories, uninstall_directories))
+}
+
+fn resolve_uninstall_directory(
+    raw_target: &str,
+    install_path: &Path,
+    info: &InstallerInfo,
+) -> Result<PathBuf> {
+    let path = resolve_package_target(raw_target, install_path, info)?;
+    let normalized_path = normalize_path(&path);
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+        || path_in_directory(&normalize_path(install_path), &normalized_path)
+        || [
+            "LOCALAPPDATA",
+            "APPDATA",
+            "ProgramData",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "USERPROFILE",
+        ]
+        .iter()
+        .filter_map(env::var_os)
+        .any(|root| normalized_path == normalize_path(&PathBuf::from(root)))
+        || normalized_path == normalize_path(&env::temp_dir())
+        || path
+            .components()
+            .filter(|part| matches!(part, Component::Normal(_)))
+            .count()
+            < 2
+    {
+        bail!("unsafe UninstallDirectories target: {}", path.display());
+    }
+    Ok(path)
+}
+
+fn remove_configured_directories(directories: &[PathBuf]) -> Result<()> {
+    for path in directories {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+            }
+        };
+        if !metadata.file_type().is_dir() {
+            bail!(
+                "UninstallDirectories target is not a directory: {}",
+                path.display()
+            );
+        }
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove configured directory {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn resolve_package_target(
@@ -643,4 +721,73 @@ fn registry_read_flags(is_64_target: bool) -> u32 {
 
 fn registry_write_flags(is_64_target: bool) -> u32 {
     KEY_WRITE | registry_view_flag(is_64_target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn uninstall_directories_reject_parent_and_environment_root() {
+        let info: InstallerInfo = serde_json::from_str(
+            r#"{"DisplayName":"Kitopia","Is64":true,"UninstallDirectories":[{"Target":".."}]}"#,
+        )
+        .unwrap();
+        let install_path = env::temp_dir().join("Kitopia");
+        assert!(collect_uninstall_target_directories(&info, &install_path).is_err());
+
+        let info: InstallerInfo = serde_json::from_str(
+            r#"{"DisplayName":"Kitopia","Is64":true,"UninstallDirectories":[{"Target":"{Temp}"}]}"#,
+        )
+        .unwrap();
+        assert!(collect_uninstall_target_directories(&info, &install_path).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_directory_is_scanned_and_removed_without_touching_sibling() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            env::temp_dir().join(format!("kitopia-uninstall-{}-{unique}", std::process::id()));
+        let install_path = root.join("app");
+        let configured_dir = root.join("data");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::create_dir_all(&configured_dir).unwrap();
+        let locked_file = configured_dir.join("data.db");
+        fs::write(&locked_file, b"data").unwrap();
+        let info: InstallerInfo = serde_json::from_value(serde_json::json!({
+            "DisplayName": "Kitopia",
+            "Is64": true,
+            "InstallPackages": [{ "Package": "app.zip", "Target": "{InstallDir}" }],
+            "UninstallDirectories": [{ "Target": configured_dir.to_string_lossy() }]
+        }))
+        .unwrap();
+        let (target_directories, uninstall_directories) =
+            collect_uninstall_target_directories(&info, &install_path).unwrap();
+        assert_eq!(
+            target_directories,
+            vec![install_path.clone(), configured_dir.clone()]
+        );
+        assert_eq!(uninstall_directories, vec![configured_dir.clone()]);
+
+        let handle = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked_file)
+            .unwrap();
+        assert_eq!(
+            find_locked_files_in_directories(&target_directories).unwrap(),
+            vec![locked_file]
+        );
+        drop(handle);
+
+        remove_configured_directories(&uninstall_directories).unwrap();
+        assert!(!configured_dir.exists());
+        assert!(install_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
