@@ -7,13 +7,22 @@ edition = "2024"
 anyhow = "1.0"
 dirs = "6.0"
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
+rfd = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.38"
 winreg = "0.56"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_RestartManager", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_RestartManager",
+    "Win32_System_Threading",
+] }
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "wgsl", "dx12", "vulkan", "gles"] }
+
+[build-dependencies]
+embed-resource = "2.5"
 
 [profile.release]
 opt-level = "z"
