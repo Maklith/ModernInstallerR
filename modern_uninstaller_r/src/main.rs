@@ -1,6 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{
     Arc,
     mpsc::{self, Receiver},
@@ -8,8 +13,9 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use eframe::egui::{self, Color32, RichText, ViewportBuilder};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 
 mod model;
 mod resources;
@@ -17,7 +23,9 @@ mod ui_fonts;
 mod uninstall_engine;
 mod util;
 
-use crate::uninstall_engine::{self as installer_engine, LockingProcessInfo, ProgressState, UninstallTarget};
+use crate::uninstall_engine::{
+    self as installer_engine, LockingProcessInfo, ProgressState, UninstallTarget,
+};
 
 enum UninstallPhase {
     BeforeUninstall,
@@ -362,33 +370,129 @@ fn run_silent_uninstall() -> Result<()> {
     Ok(())
 }
 
-fn main() -> eframe::Result {
-    if env::args().any(|arg| arg == "--silent") {
-        if let Err(error) = run_silent_uninstall() {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-        return Ok(());
+fn relaunch_from_temp() -> Result<bool> {
+    if env::args().any(|arg| arg == "--from-temp") {
+        return Ok(false);
     }
 
-    let app = UninstallerApp::new();
-    let uninstaller_icon =
-        resources::uninstaller_icon_data().expect("failed to load uninstaller icon");
-    let native_options = eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_title("ModernInstaller")
-            .with_inner_size([600.0, 370.0])
-            .with_resizable(false)
-            .with_icon(uninstaller_icon),
-        centered: true,
-        ..Default::default()
+    let source = env::current_exe().context("读取卸载器路径失败")?;
+    let temp_dir = env::temp_dir().join("ModernInstaller").join("uninstaller");
+    fs::create_dir_all(&temp_dir).context("创建卸载器临时目录失败")?;
+    let temp_exe = temp_dir.join(format!(
+        "ModernInstaller.Uninstaller-{}.exe",
+        std::process::id()
+    ));
+    fs::copy(&source, &temp_exe).context("复制卸载器到临时目录失败")?;
+
+    let mut command = Command::new(&temp_exe);
+    command.args(env::args_os().skip(1));
+    command.arg("--from-temp");
+    command.current_dir(&temp_dir);
+    command.spawn().context("启动临时卸载器失败")?;
+    Ok(true)
+}
+
+fn uninstaller_log_path() -> PathBuf {
+    env::temp_dir()
+        .join("ModernInstaller")
+        .join("ModernInstaller.Uninstaller.log")
+}
+
+fn append_uninstaller_log(message: &str) {
+    let log_path = uninstaller_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) else {
+        return;
     };
-    eframe::run_native(
-        "ModernInstaller",
-        native_options,
-        Box::new(move |cc| {
-            ui_fonts::apply_harmony_font(&cc.egui_ctx);
-            Ok(Box::new(app))
-        }),
-    )
+    let _ = writeln!(file, "{:?} {message}", std::time::SystemTime::now());
+}
+
+fn run_gui_uninstall() -> Result<()> {
+    append_uninstaller_log("starting GUI uninstaller");
+    let mut renderer_errors = Vec::new();
+    for renderer in [eframe::Renderer::Wgpu, eframe::Renderer::Glow] {
+        append_uninstaller_log(&format!("trying renderer: {renderer:?}"));
+        let app = UninstallerApp::new();
+        let icon = resources::uninstaller_icon_data().context("failed to load uninstaller icon")?;
+        let native_options = eframe::NativeOptions {
+            viewport: ViewportBuilder::default()
+                .with_title("ModernInstaller")
+                .with_inner_size([600.0, 370.0])
+                .with_resizable(false)
+                .with_icon(icon),
+            centered: true,
+            renderer,
+            ..Default::default()
+        };
+        match eframe::run_native(
+            "ModernInstaller",
+            native_options,
+            Box::new(move |cc| {
+                ui_fonts::apply_harmony_font(&cc.egui_ctx);
+                Ok(Box::new(app))
+            }),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let text = format!("{renderer:?}: {error}");
+                append_uninstaller_log(&format!("renderer startup failed: {text}"));
+                renderer_errors.push(text);
+            }
+        }
+    }
+    Err(anyhow!(
+        "failed to create uninstaller window: {}",
+        renderer_errors.join(" | ")
+    ))
+}
+
+fn main() {
+    panic::set_hook(Box::new(|panic_info| {
+        append_uninstaller_log(&format!("panic: {panic_info}"));
+        append_uninstaller_log(&format!(
+            "backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        ));
+    }));
+
+    let silent = env::args().any(|arg| arg == "--silent");
+    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+        if relaunch_from_temp()? {
+            return Ok(());
+        }
+        if silent {
+            run_silent_uninstall()
+        } else {
+            run_gui_uninstall()
+        }
+    }));
+    let error = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.to_string(),
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+            })
+            .unwrap_or_else(|| "unknown panic payload".to_owned()),
+    };
+    append_uninstaller_log(&format!("uninstaller failed: {error}"));
+    if !silent {
+        let description = format!(
+            "卸载器启动失败\n{error}\n\n日志文件:\n{}",
+            uninstaller_log_path().display()
+        );
+        let _ = MessageDialog::new()
+            .set_level(MessageLevel::Error)
+            .set_title("ModernInstaller")
+            .set_description(&description)
+            .set_buttons(MessageButtons::Ok)
+            .show();
+    }
+    std::process::exit(1);
 }
