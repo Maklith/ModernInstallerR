@@ -4,33 +4,25 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use flate2::read::GzDecoder;
 #[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
-#[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use sysinfo::{ProcessesToUpdate, Signal, System};
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA};
-#[cfg(windows)]
-use windows_sys::Win32::System::RestartManager::{
-    CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources,
-    RmStartSession,
-};
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, KEY_WRITE};
 use zip::ZipArchive;
 
+pub use crate::file_locks::{LockingProcessInfo, find_locked_files_in_directory};
+use crate::file_locks::{
+    collect_locking_process_infos, find_locked_files_in_directories, find_locking_process_ids,
+    terminate_processes_locking_directories,
+};
 use crate::model::{InstallDependencyRule, InstallerInfo};
+use crate::path_template::{
+    remove_configured_directories, resolve_target_path, resolve_uninstall_directory,
+};
 use crate::resources::{self, EmbeddedPackage};
 use crate::util::{
     default_install_dir_for_arch, escape_ps_single_quote, is_windows_64bit_os, normalize_path,
@@ -40,17 +32,7 @@ use crate::version::LooseVersion;
 
 const UNINSTALL_REGISTRY_ROOT: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 #[cfg(windows)]
-const ERROR_SHARING_VIOLATION: i32 = 32;
-#[cfg(windows)]
-const ERROR_LOCK_VIOLATION: i32 = 33;
-#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-#[cfg(windows)]
-const ACCESS_DELETE: u32 = 0x0001_0000;
-#[cfg(windows)]
-const ACCESS_GENERIC_READ: u32 = 0x8000_0000;
-#[cfg(windows)]
-const ACCESS_GENERIC_WRITE: u32 = 0x4000_0000;
 
 #[derive(Clone, Debug, Default)]
 pub struct ExistingInstall {
@@ -64,12 +46,6 @@ pub struct ExistingInstall {
 pub struct InstallResult {
     pub installed_path: PathBuf,
     pub executable_path: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-pub struct LockingProcessInfo {
-    pub pid: u32,
-    pub name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -91,8 +67,8 @@ impl ProgressState {
 pub struct UninstallTarget {
     pub app_name: String,
     pub install_path: PathBuf,
-    pub main_file: String,
     pub is_64: bool,
+    pub uninstall_directories: Vec<PathBuf>,
 }
 
 pub fn suggested_install_path(info: &InstallerInfo, existing: &ExistingInstall) -> PathBuf {
@@ -175,17 +151,6 @@ pub fn validate_install(
     Ok(())
 }
 
-pub fn find_locked_files_in_directory(directory: &Path) -> Result<Vec<PathBuf>> {
-    if !directory.exists() || !directory.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut locked_files = Vec::new();
-    collect_locked_files_recursively(directory, &mut locked_files)?;
-    locked_files.sort();
-    Ok(locked_files)
-}
-
 pub fn find_locked_files_for_install(
     info: &InstallerInfo,
     install_path: &Path,
@@ -211,6 +176,7 @@ pub fn find_lock_preview_for_install(
 pub fn run_install<F, C>(
     info: &InstallerInfo,
     install_path: &Path,
+    create_shortcuts: bool,
     mut report_progress: F,
     mut confirm_terminate: C,
 ) -> Result<InstallResult>
@@ -220,7 +186,8 @@ where
 {
     report_progress(ProgressState::new(8, "正在准备安装"));
     report_progress(ProgressState::new(20, "正在检测并结束相关进程"));
-    terminate_processes_for_install_targets(info, install_path, &mut confirm_terminate)
+    let target_directories = collect_install_target_directories(info, install_path)?;
+    terminate_processes_locking_directories(&target_directories, false, &mut confirm_terminate)
         .context("中止目标进程时出现错误,安装被中止")?;
 
     report_progress(ProgressState::new(28, "正在检查在线依赖"));
@@ -234,15 +201,15 @@ where
     write_install_support_files(install_path).context("创建卸载程序时出现错误,安装被中止")?;
 
     report_progress(ProgressState::new(92, "正在写入注册表并创建快捷方式"));
-    write_registry_values(info, install_path)
-        .and_then(|_| {
-            create_or_replace_shortcuts(
-                &info.display_name,
-                &install_path.join(&info.can_execute_path),
-                install_path,
-            )
-        })
-        .context("写入注册表或创建快捷方式时出现错误,安装被中止")?;
+    write_registry_values(info, install_path).context("写入注册表时出现错误,安装被中止")?;
+    if create_shortcuts {
+        create_or_replace_shortcuts(
+            &info.display_name,
+            &install_path.join(&info.can_execute_path),
+            install_path,
+        )
+        .context("创建快捷方式时出现错误,安装被中止")?;
+    }
 
     report_progress(ProgressState::new(100, "安装完成"));
     Ok(InstallResult {
@@ -256,18 +223,23 @@ pub fn resolve_uninstall_target(info: &InstallerInfo) -> Result<UninstallTarget>
     let install_path = existing
         .installed_path
         .ok_or_else(|| anyhow::anyhow!("安装程序未找到"))?;
-    let main_file = existing
-        .main_file
-        .unwrap_or_else(|| info.can_execute_path.clone());
     let app_name = existing
         .display_name
         .unwrap_or_else(|| info.display_name.clone());
+    let uninstall_directories = info
+        .uninstall_directories
+        .iter()
+        .map(|rule| {
+            resolve_uninstall_directory(&rule.target, &install_path, &info.display_name)
+                .with_context(|| format!("invalid UninstallDirectories target: {}", rule.target))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(UninstallTarget {
         app_name,
         install_path,
-        main_file,
         is_64: info.is_64,
+        uninstall_directories,
     })
 }
 
@@ -281,13 +253,15 @@ where
     C: FnMut(&[LockingProcessInfo]) -> Result<bool>,
 {
     report_progress(ProgressState::new(10, "正在准备卸载"));
-    report_progress(ProgressState::new(35, "正在结束正在运行的应用进程"));
-    terminate_processes_by_path(
-        &target.install_path.join(&target.main_file),
-        &mut confirm_terminate,
-    )
-    .context("中止目标进程时出现错误,卸载被中止")?;
+    report_progress(ProgressState::new(35, "正在检查文件占用并结束相关进程"));
+    let mut target_directories = vec![target.install_path.clone()];
+    target_directories.extend_from_slice(&target.uninstall_directories);
+    terminate_processes_locking_directories(&target_directories, true, &mut confirm_terminate)
+        .context("中止目标进程时出现错误,卸载被中止")?;
 
+    report_progress(ProgressState::new(60, "正在删除配置的目录"));
+    remove_configured_directories(&target.uninstall_directories)
+        .context("删除配置的目录时出现错误,卸载被中止")?;
     report_progress(ProgressState::new(70, "正在删除安装文件"));
     remove_install_directory(&target.install_path).context("文件删除时出现错误,卸载被中止")?;
 
@@ -393,7 +367,7 @@ fn should_skip_dependency_install(
     if check_path.is_empty() {
         return Ok(false);
     }
-    let resolved_path = resolve_package_target(check_path, install_path, info)?;
+    let resolved_path = resolve_target_path(check_path, install_path, &info.display_name)?;
     if resolved_path.exists() {
         return Ok(true);
     }
@@ -550,7 +524,7 @@ fn extract_configured_packages(info: &InstallerInfo, install_path: &Path) -> Res
                 available_package_names()
             )
         })?;
-        let target_dir = resolve_package_target(&rule.target, install_path, info)
+        let target_dir = resolve_target_path(&rule.target, install_path, &info.display_name)
             .with_context(|| format!("invalid target for package {}", package.file_name))?;
         extract_embedded_package(package, &target_dir).with_context(|| {
             format!(
@@ -583,114 +557,6 @@ fn available_package_names() -> String {
         .map(|package| package.file_name)
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn resolve_package_target(
-    raw_target: &str,
-    install_path: &Path,
-    info: &InstallerInfo,
-) -> Result<PathBuf> {
-    let raw_target = raw_target.trim();
-    if raw_target.is_empty() {
-        bail!("target path template is empty");
-    }
-
-    let install_dir = install_path.to_string_lossy().to_string();
-    let mut resolved = raw_target.to_owned();
-
-    replace_placeholder_case_insensitive(&mut resolved, "{InstallDir}", &install_dir);
-    replace_placeholder_case_insensitive(&mut resolved, "{InstallPath}", &install_dir);
-    replace_placeholder_case_insensitive(&mut resolved, "{DisplayName}", &info.display_name);
-
-    replace_env_placeholder(&mut resolved, "{LocalUserData}", "LOCALAPPDATA")?;
-    replace_env_placeholder(&mut resolved, "{LocalAppData}", "LOCALAPPDATA")?;
-    replace_env_placeholder(&mut resolved, "%LOCALAPPDATA%", "LOCALAPPDATA")?;
-
-    replace_env_placeholder(&mut resolved, "{AppData}", "APPDATA")?;
-    replace_env_placeholder(&mut resolved, "{RoamingAppData}", "APPDATA")?;
-    replace_env_placeholder(&mut resolved, "%APPDATA%", "APPDATA")?;
-
-    replace_env_placeholder(&mut resolved, "{ProgramData}", "ProgramData")?;
-    replace_env_placeholder(&mut resolved, "%ProgramData%", "ProgramData")?;
-
-    replace_env_placeholder(&mut resolved, "{ProgramFiles}", "ProgramFiles")?;
-    replace_env_placeholder(&mut resolved, "%ProgramFiles%", "ProgramFiles")?;
-    replace_env_placeholder(&mut resolved, "{ProgramFilesX86}", "ProgramFiles(x86)")?;
-    replace_env_placeholder(&mut resolved, "%ProgramFiles(x86)%", "ProgramFiles(x86)")?;
-
-    replace_env_placeholder(&mut resolved, "{UserProfile}", "USERPROFILE")?;
-    replace_env_placeholder(&mut resolved, "%USERPROFILE%", "USERPROFILE")?;
-
-    replace_placeholder_case_insensitive(
-        &mut resolved,
-        "{Temp}",
-        &env::temp_dir().to_string_lossy(),
-    );
-
-    if has_unresolved_brace_placeholder(&resolved) {
-        bail!("unknown placeholder in target path: {raw_target}");
-    }
-
-    let mut target_path = PathBuf::from(resolved.trim());
-    if target_path.as_os_str().is_empty() {
-        bail!("resolved target path is empty");
-    }
-    if !target_path.is_absolute() {
-        target_path = install_path.join(target_path);
-    }
-
-    Ok(target_path)
-}
-
-fn replace_env_placeholder(target: &mut String, placeholder: &str, env_name: &str) -> Result<()> {
-    if !contains_ignore_ascii_case(target, placeholder) {
-        return Ok(());
-    }
-    let Some(value) = env::var_os(env_name) else {
-        bail!("placeholder {placeholder} requires environment variable {env_name}");
-    };
-    let value = PathBuf::from(value).to_string_lossy().to_string();
-    replace_placeholder_case_insensitive(target, placeholder, &value);
-    Ok(())
-}
-
-fn contains_ignore_ascii_case(input: &str, pattern: &str) -> bool {
-    input
-        .to_ascii_lowercase()
-        .contains(&pattern.to_ascii_lowercase())
-}
-
-fn replace_placeholder_case_insensitive(target: &mut String, placeholder: &str, replacement: &str) {
-    let placeholder_lower = placeholder.to_ascii_lowercase();
-    let mut remaining = target.as_str();
-    let mut output = String::with_capacity(target.len().max(replacement.len()));
-
-    loop {
-        let lower_remaining = remaining.to_ascii_lowercase();
-        let Some(index) = lower_remaining.find(&placeholder_lower) else {
-            output.push_str(remaining);
-            break;
-        };
-        output.push_str(&remaining[..index]);
-        output.push_str(replacement);
-        remaining = &remaining[index + placeholder.len()..];
-    }
-
-    *target = output;
-}
-
-fn has_unresolved_brace_placeholder(input: &str) -> bool {
-    let mut opened = false;
-    for ch in input.chars() {
-        if ch == '{' {
-            opened = true;
-            continue;
-        }
-        if ch == '}' && opened {
-            return true;
-        }
-    }
-    false
 }
 
 fn extract_embedded_package(package: &EmbeddedPackage, target_dir: &Path) -> Result<()> {
@@ -821,21 +687,6 @@ fn delete_registry_values(is_64_target: bool) -> Result<()> {
     Ok(())
 }
 
-fn find_locked_files_in_directories(directories: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut locked_files = Vec::new();
-    let mut seen_paths = HashSet::new();
-    for directory in directories {
-        for file_path in find_locked_files_in_directory(directory)? {
-            let normalized = normalize_path(&file_path);
-            if seen_paths.insert(normalized) {
-                locked_files.push(file_path);
-            }
-        }
-    }
-    locked_files.sort();
-    Ok(locked_files)
-}
-
 fn collect_install_target_directories(
     info: &InstallerInfo,
     install_path: &Path,
@@ -857,7 +708,7 @@ fn collect_install_target_directories(
             bail!("InstallPackages contains an empty Package value");
         }
 
-        let target_dir = resolve_package_target(&rule.target, install_path, info)
+        let target_dir = resolve_target_path(&rule.target, install_path, &info.display_name)
             .with_context(|| format!("invalid target for package {}", package_name))?;
         if seen_directories.insert(normalize_path(&target_dir)) {
             directories.push(target_dir);
@@ -865,466 +716,6 @@ fn collect_install_target_directories(
     }
 
     Ok(directories)
-}
-
-fn collect_locked_files_recursively(
-    directory: &Path,
-    locked_files: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let entries = fs::read_dir(directory)
-        .with_context(|| format!("failed to read directory {}", directory.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            collect_locked_files_recursively(&path, locked_files)?;
-            continue;
-        }
-        if file_type.is_file() && is_file_locked(&path) {
-            locked_files.push(path);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn is_file_locked(path: &Path) -> bool {
-    let open_result = fs::OpenOptions::new()
-        .access_mode(ACCESS_GENERIC_READ | ACCESS_GENERIC_WRITE | ACCESS_DELETE)
-        .share_mode(0)
-        .open(path);
-    match open_result {
-        Ok(_) => false,
-        Err(error) => matches!(
-            error.raw_os_error(),
-            Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION)
-        ),
-    }
-}
-
-#[cfg(not(windows))]
-fn is_file_locked(_path: &Path) -> bool {
-    false
-}
-
-#[cfg(windows)]
-fn find_locking_process_ids(locked_files: &[PathBuf]) -> Result<Vec<u32>> {
-    if locked_files.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut session_handle = 0u32;
-    let mut session_key = [0u16; (CCH_RM_SESSION_KEY as usize) + 1];
-    let start_status = unsafe { RmStartSession(&mut session_handle, 0, session_key.as_mut_ptr()) };
-    if start_status != 0 {
-        bail!("RmStartSession failed with code {start_status}");
-    }
-
-    let result = (|| -> Result<Vec<u32>> {
-        let wide_paths = locked_files
-            .iter()
-            .map(|path| {
-                path.as_os_str()
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect::<Vec<u16>>()
-            })
-            .collect::<Vec<_>>();
-        let path_ptrs = wide_paths
-            .iter()
-            .map(|path| path.as_ptr())
-            .collect::<Vec<_>>();
-
-        let register_status = unsafe {
-            RmRegisterResources(
-                session_handle,
-                path_ptrs.len() as u32,
-                path_ptrs.as_ptr(),
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if register_status != 0 {
-            bail!("RmRegisterResources failed with code {register_status}");
-        }
-
-        let mut process_info_needed = 0u32;
-        let mut process_info_count = 0u32;
-        let mut reboot_reasons = 0u32;
-        let first_get_status = unsafe {
-            RmGetList(
-                session_handle,
-                &mut process_info_needed,
-                &mut process_info_count,
-                std::ptr::null_mut(),
-                &mut reboot_reasons,
-            )
-        };
-
-        if first_get_status == 0 {
-            return Ok(Vec::new());
-        }
-        if first_get_status != ERROR_MORE_DATA {
-            bail!("RmGetList failed with code {first_get_status}");
-        }
-
-        let mut process_infos =
-            vec![unsafe { std::mem::zeroed::<RM_PROCESS_INFO>() }; process_info_needed as usize];
-        process_info_count = process_info_needed;
-        let second_get_status = unsafe {
-            RmGetList(
-                session_handle,
-                &mut process_info_needed,
-                &mut process_info_count,
-                process_infos.as_mut_ptr(),
-                &mut reboot_reasons,
-            )
-        };
-        if second_get_status != 0 {
-            bail!("RmGetList(second call) failed with code {second_get_status}");
-        }
-
-        process_infos.truncate(process_info_count as usize);
-        let mut process_ids = process_infos
-            .into_iter()
-            .map(|info| info.Process.dwProcessId)
-            .filter(|pid| *pid != 0)
-            .collect::<Vec<_>>();
-        process_ids.sort_unstable();
-        process_ids.dedup();
-        Ok(process_ids)
-    })();
-
-    let _ = unsafe { RmEndSession(session_handle) };
-    result
-}
-
-#[cfg(not(windows))]
-fn find_locking_process_ids(_locked_files: &[PathBuf]) -> Result<Vec<u32>> {
-    Ok(Vec::new())
-}
-
-fn collect_locking_process_infos(
-    target_directories: &[PathBuf],
-    locking_pids: &[u32],
-) -> Vec<LockingProcessInfo> {
-    let normalized_target_dirs = target_directories
-        .iter()
-        .map(|directory| normalize_path(directory))
-        .collect::<Vec<_>>();
-    let locking_pid_set = locking_pids.iter().copied().collect::<HashSet<u32>>();
-    let current_pid = std::process::id();
-
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-
-    let mut infos = Vec::new();
-    let mut seen_pids = HashSet::new();
-    for process in system.processes().values() {
-        let pid = process.pid().as_u32();
-        if pid == 0 || pid == current_pid {
-            continue;
-        }
-
-        let in_locking_pid_set = locking_pid_set.contains(&pid);
-        let in_target_directory = process.exe().is_some_and(|exe| {
-            let normalized_exe = normalize_path(exe);
-            normalized_target_dirs
-                .iter()
-                .any(|target_dir| path_in_directory(&normalized_exe, target_dir))
-        });
-        let should_include = if locking_pid_set.is_empty() {
-            in_target_directory
-        } else {
-            in_locking_pid_set || in_target_directory
-        };
-
-        if !should_include || !seen_pids.insert(pid) {
-            continue;
-        }
-
-        infos.push(LockingProcessInfo {
-            pid,
-            name: process.name().to_string_lossy().to_string(),
-        });
-    }
-
-    for pid in locking_pids {
-        if *pid == 0 || *pid == current_pid || !seen_pids.insert(*pid) {
-            continue;
-        }
-        infos.push(LockingProcessInfo {
-            pid: *pid,
-            name: "Unknown".to_string(),
-        });
-    }
-
-    infos.sort_by_key(|info| info.pid);
-    infos
-}
-
-fn collect_processes_by_executable_path(executable_path: &Path) -> Vec<LockingProcessInfo> {
-    let target = normalize_path(executable_path);
-    if target.is_empty() {
-        return Vec::new();
-    }
-
-    let current_pid = std::process::id();
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-
-    let mut infos = Vec::new();
-    let mut seen_pids = HashSet::new();
-    for process in system.processes().values() {
-        let pid = process.pid().as_u32();
-        if pid == 0 || pid == current_pid || !seen_pids.insert(pid) {
-            continue;
-        }
-        let Some(exe) = process.exe() else {
-            continue;
-        };
-        if normalize_path(exe) != target {
-            continue;
-        }
-
-        infos.push(LockingProcessInfo {
-            pid,
-            name: process.name().to_string_lossy().to_string(),
-        });
-    }
-
-    infos.sort_by_key(|info| info.pid);
-    infos
-}
-
-#[cfg(windows)]
-fn kill_by_pid_fallback(pid: u32) -> bool {
-    if pid == 0 || pid == std::process::id() {
-        return false;
-    }
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
-
-    let terminated = unsafe { TerminateProcess(handle, 1) != 0 };
-    unsafe {
-        CloseHandle(handle);
-    }
-    terminated
-}
-
-#[cfg(not(windows))]
-fn kill_by_pid_fallback(_pid: u32) -> bool {
-    false
-}
-
-fn terminate_processes_for_install_targets<C>(
-    info: &InstallerInfo,
-    install_path: &Path,
-    confirm_terminate: &mut C,
-) -> Result<()>
-where
-    C: FnMut(&[LockingProcessInfo]) -> Result<bool>,
-{
-    let target_directories = collect_install_target_directories(info, install_path)?;
-    let normalized_target_dirs = target_directories
-        .iter()
-        .map(|directory| normalize_path(directory))
-        .collect::<Vec<_>>();
-    let current_pid = std::process::id();
-    let mut locked_files = find_locked_files_in_directories(&target_directories)?;
-    if locked_files.is_empty() {
-        return Ok(());
-    }
-
-    let initial_locking_pids = find_locking_process_ids(&locked_files).unwrap_or_default();
-    let processes_to_terminate =
-        collect_locking_process_infos(&target_directories, &initial_locking_pids);
-    if !processes_to_terminate.is_empty()
-        && !confirm_terminate(&processes_to_terminate).context("安装时确认终止进程失败")?
-    {
-        bail!("安装已取消");
-    }
-
-    for attempt in 0..10 {
-        let locking_pids = find_locking_process_ids(&locked_files).unwrap_or_default();
-        let locking_pid_set = locking_pids.iter().copied().collect::<HashSet<u32>>();
-
-        let mut system = System::new_all();
-        system.refresh_processes(ProcessesToUpdate::All, true);
-
-        let mut matched_any = false;
-        let mut handled_locking_pids = HashSet::new();
-
-        for process in system.processes().values() {
-            let pid = process.pid().as_u32();
-            if pid == 0 || pid == current_pid {
-                continue;
-            }
-
-            let in_locking_pid_set = locking_pid_set.contains(&pid);
-            let in_target_directory = process.exe().is_some_and(|exe| {
-                let normalized_exe = normalize_path(exe);
-                normalized_target_dirs
-                    .iter()
-                    .any(|target_dir| path_in_directory(&normalized_exe, target_dir))
-            });
-            let should_kill = in_locking_pid_set || in_target_directory;
-
-            if !should_kill {
-                continue;
-            }
-
-            if in_locking_pid_set {
-                handled_locking_pids.insert(pid);
-            }
-            matched_any = true;
-            let killed = process
-                .kill_with(Signal::Kill)
-                .or_else(|| Some(process.kill()))
-                .unwrap_or(false);
-            if !killed {
-                let _ = kill_by_pid_fallback(pid);
-            }
-        }
-
-        for pid in locking_pid_set {
-            if pid == 0 || pid == current_pid || handled_locking_pids.contains(&pid) {
-                continue;
-            }
-            matched_any = true;
-            let _ = kill_by_pid_fallback(pid);
-        }
-
-        if !matched_any {
-            thread::sleep(Duration::from_millis(800));
-        } else {
-            thread::sleep(Duration::from_millis(800));
-        }
-
-        locked_files = locked_files
-            .into_iter()
-            .filter(|path| path.is_file() && is_file_locked(path))
-            .collect();
-        if locked_files.is_empty() {
-            return Ok(());
-        }
-
-        // Avoid repeatedly crawling large target directories on every retry.
-        // Re-scan periodically to catch newly-created or newly-locked files.
-        if attempt % 3 == 2 {
-            locked_files = find_locked_files_in_directories(&target_directories)?;
-            if locked_files.is_empty() {
-                return Ok(());
-            }
-        }
-    }
-
-    let remaining_locked_files = find_locked_files_in_directories(&target_directories)?;
-    let locking_pids = find_locking_process_ids(&remaining_locked_files).unwrap_or_default();
-    let example_files = remaining_locked_files
-        .iter()
-        .take(3)
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let process_summary = if locking_pids.is_empty() {
-        String::new()
-    } else {
-        let mut system = System::new_all();
-        system.refresh_processes(ProcessesToUpdate::All, true);
-        let names = locking_pids
-            .into_iter()
-            .take(6)
-            .map(|pid| {
-                system
-                    .processes()
-                    .values()
-                    .find(|process| process.pid().as_u32() == pid)
-                    .map(|process| format!("{}({pid})", process.name().to_string_lossy()))
-                    .unwrap_or_else(|| format!("pid {pid}"))
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("; locking processes: {names}")
-    };
-    bail!(
-        "failed to terminate processes locking install target files: {} file(s) still locked{}{}",
-        remaining_locked_files.len(),
-        if example_files.is_empty() {
-            String::new()
-        } else {
-            format!(" (e.g. {example_files})")
-        },
-        process_summary
-    );
-}
-
-fn path_in_directory(path: &str, directory: &str) -> bool {
-    if path == directory {
-        return true;
-    }
-    let Some(rest) = path.strip_prefix(directory) else {
-        return false;
-    };
-    directory.ends_with('\\')
-        || directory.ends_with('/')
-        || rest.starts_with('\\')
-        || rest.starts_with('/')
-}
-
-fn terminate_processes_by_path<C>(executable_path: &Path, confirm_terminate: &mut C) -> Result<()>
-where
-    C: FnMut(&[LockingProcessInfo]) -> Result<bool>,
-{
-    let processes_to_terminate = collect_processes_by_executable_path(executable_path);
-    if !processes_to_terminate.is_empty()
-        && !confirm_terminate(&processes_to_terminate).context("卸载时确认终止进程失败")?
-    {
-        bail!("卸载已取消");
-    }
-
-    let target = normalize_path(executable_path);
-    let current_pid = std::process::id();
-    for _ in 0..10 {
-        let mut system = System::new_all();
-        system.refresh_processes(ProcessesToUpdate::All, true);
-
-        let mut matched_any = false;
-        for process in system.processes().values() {
-            let pid = process.pid().as_u32();
-            if pid == 0 || pid == current_pid {
-                continue;
-            }
-            let Some(exe) = process.exe() else {
-                continue;
-            };
-            if normalize_path(exe) != target {
-                continue;
-            }
-            matched_any = true;
-            let killed = process
-                .kill_with(Signal::Kill)
-                .or_else(|| Some(process.kill()))
-                .unwrap_or(false);
-            if !killed {
-                let _ = kill_by_pid_fallback(pid);
-            }
-        }
-
-        if !matched_any {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    bail!("failed to terminate target process");
 }
 
 fn create_or_replace_shortcuts(

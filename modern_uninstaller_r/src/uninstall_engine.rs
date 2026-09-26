@@ -1,35 +1,24 @@
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use sysinfo::{ProcessesToUpdate, Signal, System};
+use anyhow::{Context, Result};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::CloseHandle;
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, KEY_WRITE};
 
+pub use crate::file_locks::LockingProcessInfo;
+use crate::file_locks::terminate_processes_locking_directories;
 use crate::model::InstallerInfo;
+use crate::path_template::{remove_configured_directories, resolve_uninstall_directory};
 use crate::resources;
 use crate::util::{normalize_path, shortcut_paths};
 
 const UNINSTALL_REGISTRY_ROOT: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-#[derive(Clone, Debug)]
-pub struct LockingProcessInfo {
-    pub pid: u32,
-    pub name: String,
-}
 
 #[derive(Clone, Debug)]
 pub struct ProgressState {
@@ -50,14 +39,13 @@ impl ProgressState {
 pub struct UninstallTarget {
     pub app_name: String,
     pub install_path: PathBuf,
-    pub main_file: String,
     pub is_64: bool,
+    pub uninstall_directories: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct ExistingInstall {
     installed_path: Option<PathBuf>,
-    main_file: Option<String>,
     display_name: Option<String>,
 }
 
@@ -66,18 +54,23 @@ pub fn resolve_uninstall_target(info: &InstallerInfo) -> Result<UninstallTarget>
     let install_path = existing
         .installed_path
         .ok_or_else(|| anyhow::anyhow!("installed program was not found"))?;
-    let main_file = existing
-        .main_file
-        .unwrap_or_else(|| info.can_execute_path.clone());
     let app_name = existing
         .display_name
         .unwrap_or_else(|| info.display_name.clone());
+    let uninstall_directories = info
+        .uninstall_directories
+        .iter()
+        .map(|rule| {
+            resolve_uninstall_directory(&rule.target, &install_path, &info.display_name)
+                .with_context(|| format!("invalid UninstallDirectories target: {}", rule.target))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(UninstallTarget {
         app_name,
         install_path,
-        main_file,
         is_64: info.is_64,
+        uninstall_directories,
     })
 }
 
@@ -91,13 +84,18 @@ where
     C: FnMut(&[LockingProcessInfo]) -> Result<bool>,
 {
     report_progress(ProgressState::new(10, "Preparing uninstall"));
-    report_progress(ProgressState::new(35, "Stopping running application processes"));
-    terminate_processes_by_path(
-        &target.install_path.join(&target.main_file),
-        &mut confirm_terminate,
-    )
-    .context("failed while terminating target processes, uninstall aborted")?;
+    report_progress(ProgressState::new(
+        35,
+        "Checking files and stopping locking processes",
+    ));
+    let mut target_directories = vec![target.install_path.clone()];
+    target_directories.extend_from_slice(&target.uninstall_directories);
+    terminate_processes_locking_directories(&target_directories, true, &mut confirm_terminate)
+        .context("failed while terminating target processes, uninstall aborted")?;
 
+    report_progress(ProgressState::new(60, "Removing configured directories"));
+    remove_configured_directories(&target.uninstall_directories)
+        .context("failed while deleting configured directories, uninstall aborted")?;
     report_progress(ProgressState::new(70, "Removing installed files"));
     remove_install_directory(&target.install_path)
         .context("failed while deleting installed files, uninstall aborted")?;
@@ -130,10 +128,6 @@ fn read_existing_install(info: &InstallerInfo) -> ExistingInstall {
         .ok()
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());
-    let main_file = entry
-        .get_value::<String, _>("MainFile")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
     let display_name = entry
         .get_value::<String, _>("DisplayName")
         .ok()
@@ -141,115 +135,12 @@ fn read_existing_install(info: &InstallerInfo) -> ExistingInstall {
 
     ExistingInstall {
         installed_path,
-        main_file,
         display_name,
     }
 }
 
 fn uninstall_entry_name() -> String {
     format!("{{{}}}_ModernInstaller", resources::application_uuid())
-}
-
-fn terminate_processes_by_path<C>(executable_path: &Path, confirm_terminate: &mut C) -> Result<()>
-where
-    C: FnMut(&[LockingProcessInfo]) -> Result<bool>,
-{
-    let processes_to_terminate = collect_processes_by_executable_path(executable_path);
-    if !processes_to_terminate.is_empty() && !confirm_terminate(&processes_to_terminate)? {
-        bail!("uninstall cancelled");
-    }
-
-    let target = normalize_path(executable_path);
-    let current_pid = std::process::id();
-    for _ in 0..10 {
-        let mut system = System::new_all();
-        system.refresh_processes(ProcessesToUpdate::All, true);
-
-        let mut matched_any = false;
-        for process in system.processes().values() {
-            let pid = process.pid().as_u32();
-            if pid == 0 || pid == current_pid {
-                continue;
-            }
-            let Some(exe) = process.exe() else {
-                continue;
-            };
-            if normalize_path(exe) != target {
-                continue;
-            }
-            matched_any = true;
-            let killed = process
-                .kill_with(Signal::Kill)
-                .or_else(|| Some(process.kill()))
-                .unwrap_or(false);
-            if !killed {
-                let _ = kill_by_pid_fallback(pid);
-            }
-        }
-
-        if !matched_any {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-
-    bail!("failed to terminate target process")
-}
-
-fn collect_processes_by_executable_path(executable_path: &Path) -> Vec<LockingProcessInfo> {
-    let target = normalize_path(executable_path);
-    if target.is_empty() {
-        return Vec::new();
-    }
-
-    let current_pid = std::process::id();
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-
-    let mut infos = Vec::new();
-    let mut seen_pids = HashSet::new();
-    for process in system.processes().values() {
-        let pid = process.pid().as_u32();
-        if pid == 0 || pid == current_pid || !seen_pids.insert(pid) {
-            continue;
-        }
-        let Some(exe) = process.exe() else {
-            continue;
-        };
-        if normalize_path(exe) != target {
-            continue;
-        }
-
-        infos.push(LockingProcessInfo {
-            pid,
-            name: process.name().to_string_lossy().to_string(),
-        });
-    }
-
-    infos.sort_by_key(|info| info.pid);
-    infos
-}
-
-#[cfg(windows)]
-fn kill_by_pid_fallback(pid: u32) -> bool {
-    if pid == 0 || pid == std::process::id() {
-        return false;
-    }
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
-
-    let terminated = unsafe { TerminateProcess(handle, 1) != 0 };
-    unsafe {
-        CloseHandle(handle);
-    }
-    terminated
-}
-
-#[cfg(not(windows))]
-fn kill_by_pid_fallback(_pid: u32) -> bool {
-    false
 }
 
 fn remove_install_directory(install_path: &Path) -> Result<()> {

@@ -137,6 +137,7 @@ impl InstallerApp {
             let result = installer_engine::run_install(
                 &info,
                 &install_path,
+                true,
                 |state| {
                     let _ = progress_tx.send(InstallWorkerEvent::Progress(state));
                 },
@@ -609,12 +610,18 @@ fn request_process_termination_confirmation(
     response_rx.recv().context("终止进程确认响应通道已关闭")
 }
 
-fn run_silent_install() -> Result<()> {
+fn run_silent_install(create_shortcuts: bool) -> Result<()> {
     let info = resources::installer_info()?;
     let existing = installer_engine::read_existing_install(&info);
     let install_path = installer_engine::suggested_install_path(&info, &existing);
     installer_engine::validate_install(&info, &install_path, true, &existing)?;
-    let result = installer_engine::run_install(&info, &install_path, |_| {}, |_| Ok(true))?;
+    let result = installer_engine::run_install(
+        &info,
+        &install_path,
+        create_shortcuts,
+        |_| {},
+        |_| Ok(true),
+    )?;
     installer_engine::launch_application(&result.executable_path, &result.installed_path)?;
     Ok(())
 }
@@ -672,7 +679,8 @@ fn main() {
     }));
 
     if env::args().any(|arg| arg == "--silent") {
-        match panic::catch_unwind(AssertUnwindSafe(run_silent_install)) {
+        let create_shortcuts = !env::args().any(|arg| arg == "--no-shortcuts");
+        match panic::catch_unwind(AssertUnwindSafe(|| run_silent_install(create_shortcuts))) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 report_startup_failure("silent install failed", &error.to_string(), false);

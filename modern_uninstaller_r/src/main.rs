@@ -11,13 +11,19 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText, ViewportBuilder};
 
+#[path = "../../src/file_locks.rs"]
+mod file_locks;
 mod model;
+#[path = "../../src/path_template.rs"]
+mod path_template;
 mod resources;
 mod ui_fonts;
 mod uninstall_engine;
 mod util;
 
-use crate::uninstall_engine::{self as installer_engine, LockingProcessInfo, ProgressState, UninstallTarget};
+use crate::uninstall_engine::{
+    self as installer_engine, LockingProcessInfo, ProgressState, UninstallTarget,
+};
 
 enum UninstallPhase {
     BeforeUninstall,
