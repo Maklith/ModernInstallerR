@@ -211,6 +211,7 @@ pub fn find_lock_preview_for_install(
 pub fn run_install<F, C>(
     info: &InstallerInfo,
     install_path: &Path,
+    create_shortcuts: bool,
     mut report_progress: F,
     mut confirm_terminate: C,
 ) -> Result<InstallResult>
@@ -233,11 +234,19 @@ where
     report_progress(ProgressState::new(82, "正在写入安装支持文件"));
     write_install_support_files(install_path).context("创建卸载程序时出现错误,安装被中止")?;
 
-    report_progress(ProgressState::new(92, "正在写入注册表并创建快捷方式"));
+    report_progress(ProgressState::new(
+        92,
+        if create_shortcuts {
+            "正在写入注册表并创建快捷方式"
+        } else {
+            "正在写入注册表"
+        },
+    ));
     write_registry_values(info, install_path)
         .and_then(|_| {
             create_or_replace_shortcuts(
-                &info.display_name,
+                create_shortcuts,
+                shortcut_paths(&info.display_name),
                 &install_path.join(&info.can_execute_path),
                 install_path,
             )
@@ -1328,12 +1337,18 @@ where
 }
 
 fn create_or_replace_shortcuts(
-    app_name: &str,
+    create_shortcuts: bool,
+    shortcuts: impl IntoIterator<Item = PathBuf>,
     target_path: &Path,
     install_dir: &Path,
 ) -> Result<()> {
-    remove_shortcuts(app_name)?;
-    for shortcut in shortcut_paths(app_name) {
+    if !create_shortcuts {
+        return Ok(());
+    }
+    for shortcut in shortcuts {
+        if shortcut.exists() {
+            fs::remove_file(&shortcut)?;
+        }
         if let Some(parent) = shortcut.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -1436,4 +1451,68 @@ fn registry_read_flags(is_64_target: bool) -> u32 {
 
 fn registry_write_flags(is_64_target: bool) -> u32 {
     KEY_WRITE | registry_view_flag(is_64_target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_shortcuts_disabled_preserves_existing_and_leaves_missing_absent() -> Result<()> {
+        let directory = env::temp_dir().join(format!(
+            "modern-installer-no-shortcuts-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory)?;
+        let existing = directory.join("existing.lnk");
+        let missing = directory.join("missing.lnk");
+        fs::write(&existing, b"existing shortcut")?;
+
+        let result = create_or_replace_shortcuts(
+            false,
+            [existing.clone(), missing.clone()],
+            &directory.join("application.exe"),
+            &directory,
+        );
+        let existing_content = fs::read(&existing)?;
+        let missing_exists = missing.exists();
+        fs::remove_dir_all(&directory)?;
+
+        result?;
+        assert_eq!(existing_content, b"existing shortcut");
+        assert!(!missing_exists);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_shortcuts_enabled_creates_and_replaces_shell_links() -> Result<()> {
+        let directory = env::temp_dir().join(format!(
+            "modern-installer-create-shortcuts-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory)?;
+        let existing = directory.join("existing.lnk");
+        let missing = directory.join("missing.lnk");
+        fs::write(&existing, b"existing shortcut")?;
+
+        let result = create_or_replace_shortcuts(
+            true,
+            [existing.clone(), missing.clone()],
+            &env::current_exe()?,
+            &directory,
+        );
+        let existing_content = fs::read(&existing)?;
+        let missing_content = fs::read(&missing)?;
+        fs::remove_dir_all(&directory)?;
+
+        result?;
+        // Shell links begin with the ShellLinkHeader size and CLSID.
+        let header = [
+            0x4c, 0, 0, 0, 0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46,
+        ];
+        assert!(existing_content.starts_with(&header));
+        assert!(missing_content.starts_with(&header));
+        Ok(())
+    }
 }

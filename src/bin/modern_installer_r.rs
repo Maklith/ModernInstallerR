@@ -40,6 +40,7 @@ struct InstallerApp {
     info: InstallerInfo,
     existing: ExistingInstall,
     install_path: String,
+    create_shortcuts: bool,
     agreed: bool,
     show_detail: bool,
     show_agreement: bool,
@@ -57,13 +58,14 @@ struct InstallerApp {
 }
 
 impl InstallerApp {
-    fn new(info: InstallerInfo) -> Self {
+    fn new(info: InstallerInfo, create_shortcuts: bool) -> Self {
         let existing = installer_engine::read_existing_install(&info);
         let suggested_path = installer_engine::suggested_install_path(&info, &existing);
         Self {
             info,
             existing,
             install_path: suggested_path.to_string_lossy().to_string(),
+            create_shortcuts,
             agreed: false,
             show_detail: false,
             show_agreement: false,
@@ -129,6 +131,7 @@ impl InstallerApp {
         self.terminate_confirmation_response_tx = None;
 
         let info = self.info.clone();
+        let create_shortcuts = self.create_shortcuts;
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
         thread::spawn(move || {
@@ -137,6 +140,7 @@ impl InstallerApp {
             let result = installer_engine::run_install(
                 &info,
                 &install_path,
+                create_shortcuts,
                 |state| {
                     let _ = progress_tx.send(InstallWorkerEvent::Progress(state));
                 },
@@ -609,17 +613,23 @@ fn request_process_termination_confirmation(
     response_rx.recv().context("终止进程确认响应通道已关闭")
 }
 
-fn run_silent_install() -> Result<()> {
+fn run_silent_install(create_shortcuts: bool) -> Result<()> {
     let info = resources::installer_info()?;
     let existing = installer_engine::read_existing_install(&info);
     let install_path = installer_engine::suggested_install_path(&info, &existing);
     installer_engine::validate_install(&info, &install_path, true, &existing)?;
-    let result = installer_engine::run_install(&info, &install_path, |_| {}, |_| Ok(true))?;
+    let result = installer_engine::run_install(
+        &info,
+        &install_path,
+        create_shortcuts,
+        |_| {},
+        |_| Ok(true),
+    )?;
     installer_engine::launch_application(&result.executable_path, &result.installed_path)?;
     Ok(())
 }
 
-fn run_gui_install() -> Result<()> {
+fn run_gui_install(create_shortcuts: bool) -> Result<()> {
     append_installer_log("starting GUI installer");
 
     let info = resources::installer_info().context("failed to load installer info")?;
@@ -629,7 +639,7 @@ fn run_gui_install() -> Result<()> {
         append_installer_log(&format!("trying renderer: {renderer:?}"));
         let installer_icon =
             resources::installer_icon_data().context("failed to load installer icon")?;
-        let app = InstallerApp::new(info.clone());
+        let app = InstallerApp::new(info.clone(), create_shortcuts);
         let native_options = eframe::NativeOptions {
             viewport: ViewportBuilder::default()
                 .with_title("ModernInstaller")
@@ -671,8 +681,9 @@ fn main() {
         append_installer_log(&format!("backtrace:\n{backtrace}"));
     }));
 
+    let create_shortcuts = !env::args().any(|arg| arg == "--no-shortcuts");
     if env::args().any(|arg| arg == "--silent") {
-        match panic::catch_unwind(AssertUnwindSafe(run_silent_install)) {
+        match panic::catch_unwind(AssertUnwindSafe(|| run_silent_install(create_shortcuts))) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 report_startup_failure("silent install failed", &error.to_string(), false);
@@ -689,7 +700,7 @@ fn main() {
         return;
     }
 
-    match panic::catch_unwind(AssertUnwindSafe(run_gui_install)) {
+    match panic::catch_unwind(AssertUnwindSafe(|| run_gui_install(create_shortcuts))) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             report_startup_failure("installer startup failed", &error.to_string(), true);
