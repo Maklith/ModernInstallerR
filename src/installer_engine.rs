@@ -704,8 +704,16 @@ fn has_unresolved_brace_placeholder(input: &str) -> bool {
 
 fn extract_embedded_package(package: &EmbeddedPackage, target_dir: &Path) -> Result<()> {
     fs::create_dir_all(target_dir)?;
-    let package_payload = inflate_gzip_bytes(package.gzip_bytes)
-        .with_context(|| format!("invalid gzip stream for {}", package.file_name))?;
+    let package_payload = match package.compression {
+        "zstd" => zstd::stream::decode_all(Cursor::new(package.compressed_bytes))
+            .with_context(|| format!("invalid zstd stream for {}", package.file_name))?,
+        "gzip" => inflate_gzip_bytes(package.compressed_bytes)
+            .with_context(|| format!("invalid gzip stream for {}", package.file_name))?,
+        unknown => bail!(
+            "unsupported package compression for {}: {unknown}",
+            package.file_name
+        ),
+    };
 
     match package.kind {
         "zip" => extract_zip_package(target_dir, &package_payload),

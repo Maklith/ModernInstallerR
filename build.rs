@@ -19,6 +19,7 @@ const GENERATED_FONT_NAME: &str = "HarmonyOS_Sans_SC_Subset.ttf";
 const GENERATED_EMBEDDED_PACKAGES_RS_NAME: &str = "embedded_packages.rs";
 const GENERATED_UNINSTALLER_GZ_NAME: &str = "ModernInstaller.Uninstaller.exe.gz";
 const GENERATED_TEXT_NAME: &str = "font_chars.txt";
+const PACKAGE_COMPRESSION: &str = "zstd";
 
 fn main() {
     if env::var("CARGO_CFG_WINDOWS").is_ok() {
@@ -92,16 +93,17 @@ fn main() {
     }
 
     let generated_packages =
-        gzip_packages(&packages, &out_dir).expect("failed to gzip embedded app packages");
+        compress_packages(&packages, &out_dir).expect("failed to compress embedded app packages");
     write_embedded_packages_rs(&generated_embedded_packages_rs, &generated_packages)
         .expect("failed to write embedded packages metadata");
     for package in &generated_packages {
         println!(
-            "cargo:warning=embedded package {} ({}) compressed {} -> {} bytes",
+            "cargo:warning=embedded package {} ({}) compressed with {}: {} -> {} bytes",
             package.file_name,
             package.kind.as_str(),
+            PACKAGE_COMPRESSION,
             package.source_len,
-            package.gz_len
+            package.compressed_len
         );
     }
 
@@ -111,7 +113,7 @@ fn main() {
         .expect("failed to gzip embedded uninstaller payload");
     println!(
         "cargo:warning=embedded uninstaller compressed {} -> {} bytes",
-        uninstaller_stats.source_len, uninstaller_stats.gz_len
+        uninstaller_stats.source_len, uninstaller_stats.compressed_len
     );
 }
 
@@ -316,8 +318,8 @@ struct GeneratedPackage {
     file_name: String,
     kind: AppPackageKind,
     source_len: usize,
-    gz_len: usize,
-    generated_gz_name: String,
+    compressed_len: usize,
+    generated_compressed_name: String,
 }
 
 fn collect_app_packages(package_dir: &Path) -> io::Result<Vec<PackageSource>> {
@@ -367,18 +369,21 @@ fn detect_archive_kind(file_name: &str) -> Option<AppPackageKind> {
     None
 }
 
-fn gzip_packages(packages: &[PackageSource], out_dir: &Path) -> io::Result<Vec<GeneratedPackage>> {
+fn compress_packages(
+    packages: &[PackageSource],
+    out_dir: &Path,
+) -> io::Result<Vec<GeneratedPackage>> {
     let mut generated = Vec::with_capacity(packages.len());
     for (index, package) in packages.iter().enumerate() {
-        let generated_gz_name = format!("Package.{index}.gz");
-        let generated_gz_path = out_dir.join(&generated_gz_name);
-        let stats = gzip_file(&package.source_path, &generated_gz_path)?;
+        let generated_compressed_name = format!("Package.{index}.zst");
+        let generated_compressed_path = out_dir.join(&generated_compressed_name);
+        let stats = zstd_file(&package.source_path, &generated_compressed_path)?;
         generated.push(GeneratedPackage {
             file_name: package.file_name.clone(),
             kind: package.kind,
             source_len: stats.source_len,
-            gz_len: stats.gz_len,
-            generated_gz_name,
+            compressed_len: stats.compressed_len,
+            generated_compressed_name,
         });
     }
     Ok(generated)
@@ -389,10 +394,11 @@ fn write_embedded_packages_rs(output_path: &Path, packages: &[GeneratedPackage])
     for package in packages {
         writeln!(
             source,
-            "    EmbeddedPackage {{ file_name: {:?}, kind: {:?}, gzip_bytes: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{}\")) }},",
+            "    EmbeddedPackage {{ file_name: {:?}, kind: {:?}, compression: {:?}, compressed_bytes: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{}\")) }},",
             package.file_name,
             package.kind.as_str(),
-            package.generated_gz_name
+            PACKAGE_COMPRESSION,
+            package.generated_compressed_name
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
     }
@@ -401,20 +407,31 @@ fn write_embedded_packages_rs(output_path: &Path, packages: &[GeneratedPackage])
     Ok(())
 }
 
-struct GzipStats {
+struct CompressionStats {
     source_len: usize,
-    gz_len: usize,
+    compressed_len: usize,
 }
 
-fn gzip_file(source_path: &Path, output_path: &Path) -> io::Result<GzipStats> {
+fn gzip_file(source_path: &Path, output_path: &Path) -> io::Result<CompressionStats> {
     let source = fs::read(source_path)?;
     let mut encoder = GzEncoder::new(Vec::with_capacity(source.len() / 2), Compression::best());
     encoder.write_all(&source)?;
     let compressed = encoder.finish()?;
     fs::write(output_path, &compressed)?;
-    Ok(GzipStats {
+    Ok(CompressionStats {
         source_len: source.len(),
-        gz_len: compressed.len(),
+        compressed_len: compressed.len(),
+    })
+}
+
+fn zstd_file(source_path: &Path, output_path: &Path) -> io::Result<CompressionStats> {
+    let source = fs::read(source_path)?;
+    let compressed = zstd::stream::encode_all(source.as_slice(), 19)
+        .map_err(|error| io::Error::other(format!("zstd compression failed: {error}")))?;
+    fs::write(output_path, &compressed)?;
+    Ok(CompressionStats {
+        source_len: source.len(),
+        compressed_len: compressed.len(),
     })
 }
 

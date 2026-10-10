@@ -24,6 +24,7 @@ sysinfo = "0.38"
 tar = "0.4"
 winreg = "0.56"
 zip = { version = "8.2", default-features = false, features = ["deflate"] }
+zstd = { version = "0.13", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_RestartManager", "Win32_System_Threading"] }
@@ -33,6 +34,7 @@ wgpu = { version = "27.0.1", default-features = false, features = ["std", "wgsl"
 font-subset = "0.1.0"
 flate2 = "1.1"
 embed-resource = "2.5"
+zstd = { version = "0.13", default-features = false }
 
 [profile.release]
 opt-level = "z"

@@ -18,7 +18,8 @@ const UNINSTALLER_ICON_PNG: &[u8] = include_bytes!("../installer_assets/IconUnin
 pub struct EmbeddedPackage {
     pub file_name: &'static str,
     pub kind: &'static str,
-    pub gzip_bytes: &'static [u8],
+    pub compression: &'static str,
+    pub compressed_bytes: &'static [u8],
 }
 
 include!(concat!(env!("OUT_DIR"), "/embedded_packages.rs"));
